@@ -6,7 +6,7 @@ use std::thread;
 use std::sync::Arc;
 use log::{info, error, debug, LevelFilter};
 use android_logger::Config;
-use crate::core::{self, DiscoveryCallback};
+use crate::core::{self, DeviceInfo, DiscoveryCallback, send_discover_once};
 
 struct AndroidBridge {
     jvm: Arc<JavaVM>,
@@ -14,25 +14,30 @@ struct AndroidBridge {
 }
 
 impl DiscoveryCallback for AndroidBridge {
-    fn on_device_found(&self, device_info: String) {
-        match self.jvm.attach_current_thread() {
-            Ok(mut env) => {
-                if let Ok(j_msg) = env.new_string(&device_info) {
-                    let result = env.call_static_method(
-                        &self.class_ref,
-                        "onDeviceFound",
-                        "(Ljava/lang/String;)V",
-                        &[JValue::from(&j_msg)],
-                    );
+    fn on_device_found(&self, device_info: DeviceInfo) {
+        if let Ok(mut env) = self.jvm.attach_current_thread() {
+            let msg = format!(
+                "{}|{}|{}|{}",
+                device_info.device_id,
+                device_info.name,
+                device_info.ip,
+                device_info.control_port,
+            );
 
-                    if let Err(e) = result {
-                        error!("Android: 回调 Java 失败: {:?}", e);
-                    } else {
-                        debug!("Android: 回调成功 -> {}", device_info);
-                    }
+            if let Ok(j_msg) = env.new_string(msg) {
+                let result = env.call_static_method(
+                    &self.class_ref,
+                    "onDeviceFound",
+                    "(Ljava/lang/String;)V",
+                    &[JValue::from(&j_msg)],
+                );
+
+                if let Err(e) = result {
+                    error!("Android 回调失败: {:?}", e);
+                } else {
+                    debug!("Android 回调成功");
                 }
             }
-            Err(e) => error!("Android: 无法 Attach JVM 线程: {:?}", e),
         }
     }
 }
@@ -40,7 +45,8 @@ impl DiscoveryCallback for AndroidBridge {
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_yukon_localsend_RustSDK_startDiscovery(
     mut env: JNIEnv,
-    _class: JClass
+    _class: JClass,
+    user_alias: JString,
 ) {
     android_logger::init_once(
         Config::default()
@@ -60,5 +66,23 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_startDiscovery(
         class_ref: class_global_ref,
     };
 
-    core::start_listening(4060, Box::new(bridge));
+    let device_name: String = env
+        .get_string(&user_alias)
+        .expect("Couldn't get java string!")
+        .into();
+
+    core::start_listening(
+        4060,
+        "android phone".into(),
+        device_name,
+        Box::new(bridge)
+    );
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_yukon_localsend_RustSDK_discoverOnce(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    core::send_discover_once(4060);
 }
