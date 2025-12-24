@@ -1,8 +1,9 @@
-use std::net::UdpSocket;
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::thread;
 use std::sync::Arc;
-use log::{info, error, debug};
+use log::{info, error, debug, warn};
 use std::time::Duration;
+use if_addrs::{get_if_addrs, IfAddr};
 
 pub struct DeviceInfo {
     pub device_id: String,
@@ -13,6 +14,13 @@ pub struct DeviceInfo {
 
 pub trait DiscoveryCallback: Send + Sync {
     fn on_device_found(&self, device_info: DeviceInfo);
+}
+
+fn caculate_broadcast(ip: Ipv4Addr, mask: Ipv4Addr) -> Ipv4Addr {
+    let ip_u32 = u32::from(ip);
+    let mask_u32 = u32::from(mask);
+    let broadcast_u32 = ip_u32 | (!mask_u32);
+    Ipv4Addr::from(broadcast_u32)
 }
 
 pub fn start_listening(
@@ -94,15 +102,22 @@ pub fn start_discovery_broadcaster(port: u16) {
         let socket = UdpSocket::bind("0.0.0.0:0").expect("无法绑定发送套接字");  // 0就是随机端口，好强
         socket.set_broadcast(true).expect("无法设置广播权限");
 
-        let broadcast_addr = format!("255.255.255.255:{}", port);
-        let msg = "DISCOVER";
+        let msg = "DISCOVER|my_id|my_name|port"; // TODO
 
         loop {
-            if let Err(e) = socket.send_to(msg.as_bytes(), &broadcast_addr) {
-                error!("发现广播失败: {:?}", e);
-            } else {
-                debug!("已发送 DISCOVER 广播");
+            let target_ips = get_target_broadcats();
+
+            for target_ip in target_ips {
+                let broadcast_addr = format!("{}:{}", target_ip, port);
+
+                if let Err(e) = socket.send_to(msg.as_bytes(), &broadcast_addr) {
+                    error!("发现广播失败: {:?}", e);
+                } else {
+                    debug!("已向 {} 发送 DISCOVER 广播", target_ip);
+                }
             }
+
+
             thread::sleep(Duration::from_secs(5));
         }
     });
@@ -111,6 +126,42 @@ pub fn start_discovery_broadcaster(port: u16) {
 pub fn send_discover_once(port: u16) {
     if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
         socket.set_broadcast(true).ok();
-        let _ = socket.send_to(b"DISCOVER", format!("192.168.0.255:{}", port));
+        let targets = get_target_broadcats();
+        for target_ip in targets {
+            // TODO
+            let _ = socket.send_to(b"DISCOVER|my_id|my_name|port", format!("{}:{}", target_ip, port));
+        }
     }
+}
+
+
+
+fn get_target_broadcats() -> Vec<String> {
+    let mut broadcasts = Vec::new();
+
+    match get_if_addrs() {
+        Ok(ifaces) => {
+            for iface in ifaces {
+                if iface.is_loopback() { continue; }
+                if let IfAddr::V4(v4_addr) = iface.addr {
+                    let ip = v4_addr.ip;
+                    let mask = v4_addr.netmask;
+                    let broadcast = caculate_broadcast(ip, mask);
+
+                    if !broadcast.is_unspecified() {
+                        broadcasts.push(broadcast.to_string());
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            error!("无法获取网络接口信息: {:?}", e);
+        }
+    }
+    if broadcasts.is_empty() {
+        warn!("未找到有效网卡，回退到全局广播 255.255.255.255");
+        broadcasts.push("255.255.255.255".to_string());
+    }
+
+    broadcasts
 }

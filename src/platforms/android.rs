@@ -1,12 +1,9 @@
 use jni::objects::{JClass, JString, JValue, GlobalRef};
-use jni::sys::jstring;
 use jni::{JavaVM, JNIEnv};
-use std::net::UdpSocket;
-use std::thread;
 use std::sync::Arc;
 use log::{info, error, debug, LevelFilter};
 use android_logger::Config;
-use crate::core::{self, DeviceInfo, DiscoveryCallback, send_discover_once};
+use crate::core::{self, DeviceInfo, DiscoveryCallback};
 
 struct AndroidBridge {
     jvm: Arc<JavaVM>,
