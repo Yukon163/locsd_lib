@@ -83,12 +83,20 @@ pub fn start_listening(
                 }
 
                 let response = format!(
-                    "HERE|{}|{}|4060",
+                    "HERE|{}|{}|{}",
                     device_id,
-                    device_name
+                    device_name,
+                    port
                 );
 
-                let _ = socket.send_to(response.as_bytes(), addr);
+                // 强制回复给对方的 4060 端口 (或其他指定的控制端口)，而不是发送方的随机源端口
+                // 因为在 P2P 模式下，对方也是在 4060 上监听消息
+                let target_port = if parts.len() == 4 { parts[3].parse().unwrap_or(4060) } else { 4060 };
+                let target_addr = format!("{}:{}", addr.ip(), target_port);
+
+                if let Err(e) = socket.send_to(response.as_bytes(), &target_addr) {
+                    error!("Core: 回复 HERE 失败 (至 {}): {:?}", target_addr, e);
+                }
             }
 
             else if msg.starts_with("HERE|") {
@@ -379,6 +387,8 @@ pub fn send_file(
         let chunk_size = file_len / parallel_cnt;
         let mut handles = vec![];
         let progress = Arc::new(Mutex::new(0u64));
+        // 使用原子布尔值标记是否有线程出错，任何一个线程出错则整体失败
+        let error_occurred = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         info!("Core: 开始并行传输，线程数: {}", parallel_cnt);
 
@@ -387,9 +397,8 @@ pub fn send_file(
             let fname = file_name.clone();
             let fpath = file_path.clone();
             let progress_ref = progress.clone();
-            let cb_ref = Arc::new(&callback); // 注意：Trait Object的跨线程共享比较麻烦，这里简化逻辑
-            // *实际工程中，建议使用 channel 将进度发送回主线程处理，而不是直接调 callback*
-
+            let error_flag = error_occurred.clone();
+            
             // 计算当前线程负责的范围
             let start = i * chunk_size;
             let mut length = chunk_size;
@@ -398,7 +407,10 @@ pub fn send_file(
             }
 
             let handle = thread::spawn(move || {
-                send_chunk(&ip, port, &fpath, &fname, start, length, progress_ref);
+                if let Err(e) = send_chunk(&ip, port, &fpath, &fname, start, length, progress_ref) {
+                    error!("线程 {} 传输失败: {:?}", i, e);
+                    error_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             });
             handles.push(handle);
         }
@@ -408,7 +420,11 @@ pub fn send_file(
             let _ = h.join();
         }
 
-        callback.on_complete(true, "发送完成".into());
+        if error_occurred.load(std::sync::atomic::Ordering::Relaxed) {
+             callback.on_complete(false, "传输过程中发生错误，请检查日志".into());
+        } else {
+             callback.on_complete(true, "发送完成".into());
+        }
     });
 }
 
@@ -420,28 +436,30 @@ fn send_chunk(
     offset: u64,
     length: u64,
     progress: Arc<Mutex<u64>>
-) {
-    let mut file = File::open(path).expect("无法打开源文件");
-    file.seek(SeekFrom::Start(offset)).expect("无法Seek");
+) -> std::io::Result<()> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
 
-    let mut stream = TcpStream::connect(format!("{}:{}", ip, port)).expect("连接失败");
+    let mut stream = TcpStream::connect(format!("{}:{}", ip, port))?;
     stream.set_nodelay(true).ok();
 
     // 发送数据头: DATA|filename|offset\n
     let header = format!("DATA|{}|{}\n", filename, offset);
-    stream.write_all(header.as_bytes()).expect("发送头失败");
+    stream.write_all(header.as_bytes())?;
 
     // 使用 take 限制读取长度，防止读过界
     let mut handle = file.take(length);
     let mut buffer = [0u8; 64 * 1024];
 
     loop {
-        let n = handle.read(&mut buffer).unwrap();
+        let n = handle.read(&mut buffer)?;
         if n == 0 { break; }
-        stream.write_all(&buffer[..n]).unwrap();
+        stream.write_all(&buffer[..n])?;
 
         // 更新进度（这里太频繁锁可能会影响性能，实际可以用 atomic 或者每传 1MB 更新一次）
-        let mut p = progress.lock().unwrap();
-        *p += n as u64;
+        if let Ok(mut p) = progress.lock() {
+            *p += n as u64;
+        }
     }
+    Ok(())
 }
