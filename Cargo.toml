@@ -3,8 +3,20 @@ name = "locsd_lib"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+bin = ["dep:rfd", "dep:eframe"]
+lib = []
+
 [lib]
+name = "localsend_core"
 crate-type = ["cdylib", "rlib"]
+required-features = ["lib"]
+
+[[bin]]
+name = "localsend_app"
+path = "src/app/wlm.rs"
+required-features = ["bin"]
 
 [dependencies]
 log = "0.4"
@@ -18,3 +30,5 @@ byteorder = "1.5"
 threadpool = "1.8"
 env_logger = "0.10"
 if-addrs = "0.13"
+eframe = { version = "0.26", optional = true }
+rfd = { version = "0.11", optional = true }
