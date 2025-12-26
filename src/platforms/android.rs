@@ -141,7 +141,7 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_startDiscovery(
 
     core::start_listening(
         4060,
-        "android phone".into(),
+        device_name.clone(),
         device_name,
         Box::new(bridge)
     );
@@ -159,7 +159,7 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_discoverOnce(
         .into();
     core::send_discover_once(
     4060,
-         "android phone".into(),
+         device_name.clone(),
          device_name,
     )
 }
@@ -186,7 +186,6 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_startFileServer(
         .expect("无法获取保存路径字符串")
         .into();
 
-    // 假设监听 4061 端口用于数据传输
     core::start_file_server(
         4061,
         save_path,

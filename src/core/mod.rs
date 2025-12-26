@@ -89,8 +89,6 @@ pub fn start_listening(
                     port
                 );
 
-                // 强制回复给对方的 4060 端口 (或其他指定的控制端口)，而不是发送方的随机源端口
-                // 因为在 P2P 模式下，对方也是在 4060 上监听消息
                 let target_port = if parts.len() == 4 { parts[3].parse().unwrap_or(4060) } else { 4060 };
                 let target_addr = format!("{}:{}", addr.ip(), target_port);
 
