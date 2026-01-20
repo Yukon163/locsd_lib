@@ -1,0 +1,116 @@
+warning: unused import: `IpAddr`
+ --> src\core\mod.rs:1:16
+  |
+1 | use std::net::{IpAddr, Ipv4Addr, UdpSocket, TcpListener, TcpStream};
+  |                ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `self`
+ --> src\core\mod.rs:7:15
+  |
+7 | use std::io::{self, Read, Seek, SeekFrom, Write};
+  |               ^^^^
+
+warning: unused import: `self`
+ --> src\core\mod.rs:8:15
+  |
+8 | use std::fs::{self, File, OpenOptions};
+  |               ^^^^
+
+warning: unused import: `error`
+ --> src\platforms\win.rs:2:17
+  |
+2 | use log::{info, error, debug};
+  |                 ^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> src\platforms\win.rs:4:5
+  |
+4 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> src\core\mod.rs:223:20
+    |
+223 |                 Ok(mut socket) => {
+    |                    ----^^^^^^
+    |                    |
+    |                    help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `bytes_read`
+   --> src\core\mod.rs:247:9
+    |
+247 |     let bytes_read = match socket.peek(&mut buf) {
+    |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bytes_read`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `locsd_lib` (lib) generated 7 warnings (run `cargo fix --lib -p locsd_lib` to apply 7 suggestions)
+   Compiling locsd_lib v0.1.0 (D:\code\locsd_lib)
+warning: unused import: `IpAddr`
+ --> src\app\..\core\mod.rs:1:16
+  |
+1 | use std::net::{IpAddr, Ipv4Addr, UdpSocket, TcpListener, TcpStream};
+  |                ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `self`
+ --> src\app\..\core\mod.rs:7:15
+  |
+7 | use std::io::{self, Read, Seek, SeekFrom, Write};
+  |               ^^^^
+
+warning: unused import: `self`
+ --> src\app\..\core\mod.rs:8:15
+  |
+8 | use std::fs::{self, File, OpenOptions};
+  |               ^^^^
+
+warning: variable does not need to be mutable
+   --> src\app\..\core\mod.rs:223:20
+    |
+223 |                 Ok(mut socket) => {
+    |                    ----^^^^^^
+    |                    |
+    |                    help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `bytes_read`
+   --> src\app\..\core\mod.rs:247:9
+    |
+247 |     let bytes_read = match socket.peek(&mut buf) {
+    |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bytes_read`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+error[E0382]: borrow of moved value: `state`
+   --> src\app\wlm.rs:388:40
+    |
+377 | ...                   drop(state);
+    |                            ----- value moved here
+...
+388 | ...                   let name = state.my_name.clone();
+    |                                  ^^^^^ value borrowed here after move
+    |
+    = note: move occurs because `state` has type `std::sync::MutexGuard<'_, AppState>`, which does not implement the `Copy` trait
+    = note: borrow occurs due to deref coercion to `AppState`
+note: deref defined here
+   --> C:\Users\Yukon\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib/rustlib/src/rust\library\std\src\sync\poison\mutex.rs:721:5
+    |
+721 |     type Target = T;
+    |     ^^^^^^^^^^^
+
+warning: unused variable: `theme`
+   --> src\app\wlm.rs:594:13
+    |
+594 |         let theme = &self.theme;
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_theme`
+
+For more information about this error, try `rustc --explain E0382`.
+warning: `locsd_lib` (bin "localsend_app") generated 6 warnings
+error: could not compile `locsd_lib` (bin "localsend_app") due to 1 previous error; 6 warnings emitted

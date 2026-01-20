@@ -1,0 +1,5 @@
+[target.aarch64-linux-android]
+linker = "C:\\Users\\Yukon\\AppData\\Local\\Android\\Sdk\\ndk\\29.0.14206865\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\aarch64-linux-android29-clang.cmd"
+
+[target.armv7-linux-androideabi]
+linker = "C:\\Users\\Yukon\\AppData\\Local\\Android\\Sdk\\ndk\\29.0.14206865\\toolchains\\llvm\\prebuilt\\windows-x86_64\\bin\\armv7a-linux-androideabi29-clang.cmd"
