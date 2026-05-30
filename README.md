@@ -19,12 +19,38 @@
 
 ## 怎么运行？
 
-### 1. 在电脑上运行 (测试)
+### 1. 编译/运行电脑端 App
 
-如果你装了 Rust 环境，可以直接运行这个命令启动电脑端 App：
+电脑端图形界面在 `src/app/wlm.rs`，对应 Cargo bin 名称是 `localsend_app`，需要启用 `bin` feature。
+
+直接运行调试版：
 
 ```bash
-cargo run --features bin
+cargo run --features bin --bin localsend_app
+```
+
+编译调试版：
+
+```bash
+cargo build --features bin --bin localsend_app
+```
+
+产物路径：
+
+```text
+target/debug/localsend_app.exe
+```
+
+编译发布版：
+
+```bash
+cargo build --release --features bin --bin localsend_app
+```
+
+产物路径：
+
+```text
+target/release/localsend_app.exe
 ```
 
 ### 2. 编译给 Android 用
