@@ -571,14 +571,6 @@ fn handle_resume_request(
         .map(|a| a.ip().to_string())
         .unwrap_or_default();
 
-    let final_path = final_path(save_dir, &filename);
-    if let Ok(metadata) = final_path.metadata() {
-        if metadata.len() == size {
-            let _ = socket.write_all(b"DONE\n");
-            return;
-        }
-    }
-
     if !callback.on_receive_request(filename.clone(), size, sender_ip) {
         let _ = socket.write_all(b"REJ\n");
         return;
@@ -596,8 +588,20 @@ fn handle_resume_request(
         meta.received.resize(chunks, false);
     }
 
-    let part_path = part_path(save_dir, &filename);
-    match OpenOptions::new().create(true).write(true).open(&part_path) {
+    let part_file_path = part_path(save_dir, &filename);
+    let part_file_valid = part_file_path
+        .metadata()
+        .map(|metadata| metadata.len() == size)
+        .unwrap_or(false);
+    if !part_file_valid && meta.received.iter().any(|done| *done) {
+        meta = ResumeMeta::new(file_id.clone(), filename.clone(), size, chunk_size);
+    }
+
+    match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&part_file_path)
+    {
         Ok(file) => {
             if let Err(e) = file.set_len(size) {
                 error!("无法预分配续传临时文件大小: {:?}", e);
@@ -618,7 +622,7 @@ fn handle_resume_request(
         return;
     }
 
-    let received = meta.received_bytes();
+    let mut received = meta.received_bytes();
     if let Ok(mut total) = total_size_store.lock() {
         *total = size;
     }
@@ -629,10 +633,33 @@ fn handle_resume_request(
         callback.on_progress(received, size);
     }
 
-    let missing = meta.missing_chunks();
+    let mut missing = meta.missing_chunks();
     if missing.is_empty() {
-        let _ = socket.write_all(b"DONE\n");
-        return;
+        let part = part_path(save_dir, &filename);
+        if part.metadata().map(|m| m.len() == size).unwrap_or(false) {
+            let (final_file, final_name) = available_final_path(save_dir, &filename);
+            match std::fs::rename(&part, &final_file) {
+                Ok(_) => {
+                    remove_resume_meta(save_dir, &file_id);
+                    callback.on_progress(size, size);
+                    callback.on_complete(true, final_name);
+                    let _ = socket.write_all(b"DONE\n");
+                    return;
+                }
+                Err(e) => {
+                    error!("续传完成重命名失败: {:?}", e);
+                }
+            }
+        }
+
+        meta = ResumeMeta::new(file_id.clone(), filename.clone(), size, chunk_size);
+        if let Err(e) = save_resume_meta(save_dir, &meta) {
+            error!("无法重置续传元数据: {:?}", e);
+            let _ = socket.write_all(b"REJ|MetaErr\n");
+            return;
+        }
+        received = 0;
+        missing = meta.missing_chunks();
     }
 
     let response = format!("ACC2|{}|{}\n", received, format_chunk_ranges(&missing));
