@@ -1,6 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-#[path = "../core/mod.rs"]
-mod core;
+use localsend_core::core;
 
 use eframe::egui::{self, Color32, Rounding, Stroke, Vec2, RichText, Frame, Margin};
 use std::sync::{Arc, Mutex};
@@ -18,7 +17,6 @@ struct Theme {
     bg_secondary: Color32,
     bg_tertiary: Color32,
     accent: Color32,
-    accent_hover: Color32,
     success: Color32,
     text_primary: Color32,
     text_secondary: Color32,
@@ -34,7 +32,6 @@ impl Default for Theme {
             bg_secondary: Color32::from_rgb(22, 33, 62),    // #16213e
             bg_tertiary: Color32::from_rgb(15, 52, 96),     // #0f3460
             accent: Color32::from_rgb(0, 217, 255),         // #00d9ff
-            accent_hover: Color32::from_rgb(0, 180, 220),
             success: Color32::from_rgb(74, 222, 128),       // #4ade80
             text_primary: Color32::from_rgb(255, 255, 255),
             text_secondary: Color32::from_rgb(200, 200, 220),
@@ -337,13 +334,6 @@ impl LocalSendApp {
 
         let cb = SenderCallback { state: state_ref, ctx };
         core::send_file(target_ip, 4061, path_str, 4, Box::new(cb));
-    }
-
-    fn send_file_with_picker(&self, target_ip: String, ctx: egui::Context) {
-        let file = rfd::FileDialog::new().pick_file();
-        if let Some(path_buf) = file {
-            self.send_file(target_ip, path_buf, ctx);
-        }
     }
 
     fn render_ui(&self, ctx: &egui::Context) {
@@ -689,8 +679,6 @@ impl LocalSendApp {
     }
 
     fn render_overlays(&self, ctx: &egui::Context) {
-        let theme = &self.theme;
-        
         // 拖拽悬浮窗
         {
             let state = self.state.lock().unwrap();

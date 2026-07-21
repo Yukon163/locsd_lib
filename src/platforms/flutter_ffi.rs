@@ -1,4 +1,5 @@
 use crate::core::{self, DeviceInfo, DiscoveryCallback, TransferCallback};
+use crate::transfer::{self, TransferEvent};
 use log::info;
 use serde_json::json;
 use std::ffi::{CStr, CString, c_char};
@@ -87,6 +88,16 @@ impl TransferCallback for FlutterTransferBridge {
             }),
         );
     }
+
+    fn on_event(&self, event: TransferEvent) {
+        emit_json(
+            self.on_event,
+            json!({
+                "type": "transferEvent",
+                "event": event,
+            }),
+        );
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -151,12 +162,12 @@ pub extern "C" fn rust_flutter_send_file(
     file_path: *const c_char,
     parallel_cnt: u64,
     on_event: FlutterEventCallback,
-) {
+) -> *mut c_char {
     let ip = c_string_arg(target_ip, "");
     let path = c_string_arg(file_path, "");
     info!("Flutter FFI: send file {} -> {}", path, ip);
 
-    core::send_file(
+    let transfer_id = core::send_file(
         ip,
         port,
         path,
@@ -166,4 +177,35 @@ pub extern "C" fn rust_flutter_send_file(
             direction: "send",
         }),
     );
+    CString::new(transfer_id)
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_flutter_cancel_transfer(transfer_id: *const c_char) -> bool {
+    transfer::cancel_transfer(&c_string_arg(transfer_id, ""))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_flutter_retry_transfer(transfer_id: *const c_char) -> bool {
+    transfer::retry_transfer(&c_string_arg(transfer_id, ""))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_flutter_accept_transfer(
+    offer_id: *const c_char,
+    destination: *const c_char,
+) -> bool {
+    transfer::accept_transfer(&c_string_arg(offer_id, ""), c_string_arg(destination, "."))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_flutter_reject_transfer(offer_id: *const c_char) -> bool {
+    transfer::reject_transfer(&c_string_arg(offer_id, ""))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_flutter_stop_server() {
+    transfer::stop_server();
 }

@@ -4,11 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+pub use crate::transfer::events::TransferCallback;
 
 const RESUME_CHUNK_SIZE: u64 = 1024 * 1024;
 const RESUME_DIR_NAME: &str = ".localsend_resume";
@@ -183,12 +185,6 @@ fn get_target_broadcats() -> Vec<String> {
     }
 
     broadcasts
-}
-
-pub trait TransferCallback: Send + Sync {
-    fn on_receive_request(&self, file_name: String, file_size: u64, sender_ip: String) -> bool;
-    fn on_progress(&self, transferred: u64, total: u64);
-    fn on_complete(&self, success: bool, msg: String);
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -390,50 +386,13 @@ fn make_file_id(filename: &str, size: u64) -> String {
 }
 
 pub fn start_file_server(port: u16, save_dir: String, callback: Box<dyn TransferCallback>) {
-    let callback = Arc::new(callback);
-    let save_dir = Arc::new(save_dir);
-
-    thread::spawn(move || {
-        info!("Core: 文件传输服务启动，监听 0.0.0.0:{}", port);
-        let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)) {
-            Ok(l) => l,
-            Err(e) => {
-                error!("Core: 无法绑定传输端口: {:?}", e);
-                return;
-            }
-        };
-
-        let progress_counter = Arc::new(Mutex::new(0u64));
-        let current_file_size = Arc::new(Mutex::new(0u64));
-
-        for stream in listener.incoming() {
-            match stream {
-                Ok(socket) => {
-                    let callback = callback.clone();
-                    let save_dir = save_dir.clone();
-                    let progress = progress_counter.clone();
-                    let total_size_store = current_file_size.clone();
-
-                    thread::spawn(move || {
-                        handle_incoming_connection(
-                            socket,
-                            save_dir,
-                            callback,
-                            progress,
-                            total_size_store,
-                        );
-                    });
-                }
-                Err(e) => error!("Core: 连接接收失败: {:?}", e),
-            }
-        }
-    });
+    crate::transfer::engine::start_server(port, save_dir, callback);
 }
 
-fn handle_incoming_connection(
+pub(crate) fn handle_incoming_connection(
     mut socket: TcpStream,
     save_dir: Arc<String>,
-    callback: Arc<Box<dyn TransferCallback>>,
+    callback: Arc<dyn TransferCallback>,
     progress_counter: Arc<Mutex<u64>>,
     total_size_store: Arc<Mutex<u64>>,
 ) {
@@ -557,7 +516,7 @@ fn handle_incoming_connection(
 fn handle_resume_request(
     mut socket: TcpStream,
     save_dir: &str,
-    callback: Arc<Box<dyn TransferCallback>>,
+    callback: Arc<dyn TransferCallback>,
     progress_counter: Arc<Mutex<u64>>,
     total_size_store: Arc<Mutex<u64>>,
     parts: &[&str],
@@ -669,7 +628,7 @@ fn handle_resume_request(
 fn handle_resume_data(
     mut socket: TcpStream,
     save_dir: &str,
-    callback: Arc<Box<dyn TransferCallback>>,
+    callback: Arc<dyn TransferCallback>,
     progress_counter: Arc<Mutex<u64>>,
     total_size_store: Arc<Mutex<u64>>,
     parts: &[&str],
@@ -805,71 +764,19 @@ pub fn send_file(
     file_path: String,
     parallel_cnt: u64,                   // 并行线程数，建议 4-8
     callback: Box<dyn TransferCallback>, // 用于回传发送进度
-) {
-    thread::spawn(move || {
-        let callback = Arc::new(callback);
-        let path = Path::new(&file_path);
-        if !path.exists() {
-            callback.on_complete(false, "文件不存在".into());
-            return;
-        }
-
-        let file_name = match path.file_name() {
-            Some(name) => name.to_string_lossy().to_string(),
-            None => {
-                callback.on_complete(false, "无效文件名".into());
-                return;
-            }
-        };
-        let file_len = match path.metadata() {
-            Ok(metadata) => metadata.len(),
-            Err(e) => {
-                callback.on_complete(false, format!("读取文件信息失败: {:?}", e));
-                return;
-            }
-        };
-        let workers = parallel_cnt.max(1).min(64) as usize;
-
-        match send_file_resume_inner(
-            &target_ip,
-            port,
-            &file_path,
-            &file_name,
-            file_len,
-            workers,
-            callback.clone(),
-        ) {
-            Ok(true) => return,
-            Ok(false) => {
-                debug!("对端不支持续传协议，回退旧传输协议");
-            }
-            Err(e) => {
-                warn!("续传协议握手失败，回退旧传输协议: {:?}", e);
-            }
-        }
-
-        if let Err(e) = send_file_legacy_inner(
-            &target_ip,
-            port,
-            &file_path,
-            &file_name,
-            file_len,
-            workers,
-            callback.clone(),
-        ) {
-            callback.on_complete(false, e);
-        }
-    });
+) -> crate::transfer::TransferId {
+    let _ = parallel_cnt;
+    crate::transfer::engine::send_file(target_ip, port, file_path, callback)
 }
 
-fn send_file_resume_inner(
+pub(crate) fn send_file_resume_inner(
     target_ip: &str,
     port: u16,
     file_path: &str,
     file_name: &str,
     file_len: u64,
     workers: usize,
-    callback: Arc<Box<dyn TransferCallback>>,
+    callback: Arc<dyn TransferCallback>,
 ) -> std::io::Result<bool> {
     let file_id = make_file_id(file_name, file_len);
     let mut stream = TcpStream::connect(format!("{}:{}", target_ip, port))?;
@@ -992,14 +899,14 @@ fn send_file_resume_inner(
     Ok(true)
 }
 
-fn send_file_legacy_inner(
+pub(crate) fn send_file_legacy_inner(
     target_ip: &str,
     port: u16,
     file_path: &str,
     file_name: &str,
     file_len: u64,
     workers: usize,
-    callback: Arc<Box<dyn TransferCallback>>,
+    callback: Arc<dyn TransferCallback>,
 ) -> Result<(), String> {
     let mut stream = TcpStream::connect(format!("{}:{}", target_ip, port))
         .map_err(|e| format!("连接失败: {:?}", e))?;
@@ -1092,7 +999,7 @@ fn send_chunk(
     progress: Arc<Mutex<u64>>,
     last_report: Arc<Mutex<u64>>,
     total: u64,
-    callback: Arc<Box<dyn TransferCallback>>,
+    callback: Arc<dyn TransferCallback>,
 ) -> std::io::Result<()> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
@@ -1136,7 +1043,7 @@ fn send_chunk_v2(
     progress: Arc<Mutex<u64>>,
     last_report: Arc<Mutex<u64>>,
     total: u64,
-    callback: Arc<Box<dyn TransferCallback>>,
+    callback: Arc<dyn TransferCallback>,
 ) -> std::io::Result<()> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
@@ -1171,7 +1078,7 @@ fn maybe_report_progress(
     current: u64,
     total: u64,
     last_report: &Arc<Mutex<u64>>,
-    callback: &Arc<Box<dyn TransferCallback>>,
+    callback: &Arc<dyn TransferCallback>,
 ) {
     let should_report = {
         let mut last = last_report.lock().unwrap();

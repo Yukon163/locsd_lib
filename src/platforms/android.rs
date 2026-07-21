@@ -1,9 +1,11 @@
-use jni::objects::{JClass, JString, JValue, GlobalRef};
-use jni::{JavaVM, JNIEnv};
-use std::sync::Arc;
-use log::{info, error, debug, LevelFilter};
-use android_logger::Config;
 use crate::core::{self, DeviceInfo, DiscoveryCallback, TransferCallback};
+use crate::transfer::{self, TransferEvent};
+use android_logger::Config;
+use jni::objects::{GlobalRef, JClass, JString, JValue};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jstring};
+use jni::{JNIEnv, JavaVM};
+use log::{LevelFilter, debug, error, info};
+use std::sync::Arc;
 
 struct AndroidDiscoveryBridge {
     jvm: Arc<JavaVM>,
@@ -15,10 +17,7 @@ impl DiscoveryCallback for AndroidDiscoveryBridge {
         if let Ok(mut env) = self.jvm.attach_current_thread() {
             let msg = format!(
                 "{}|{}|{}|{}",
-                device_info.device_id,
-                device_info.name,
-                device_info.ip,
-                device_info.control_port,
+                device_info.device_id, device_info.name, device_info.ip, device_info.control_port,
             );
 
             if let Ok(j_msg) = env.new_string(msg) {
@@ -70,7 +69,7 @@ impl TransferCallback for AndroidTransferBridge {
                 &[
                     JValue::from(&j_filename),
                     JValue::from(j_size),
-                    JValue::from(&j_sender_ip)
+                    JValue::from(&j_sender_ip),
                 ],
             );
 
@@ -99,13 +98,30 @@ impl TransferCallback for AndroidTransferBridge {
 
     fn on_complete(&self, success: bool, msg: String) {
         if let Ok(mut env) = self.jvm.attach_current_thread() {
-            let j_msg = env.new_string(msg).unwrap_or_else(|_| env.new_string("").unwrap());
+            let j_msg = env
+                .new_string(msg)
+                .unwrap_or_else(|_| env.new_string("").unwrap());
             let _ = env.call_static_method(
                 &self.class_ref,
                 "onTransferComplete",
                 "(ZLjava/lang/String;)V", // (boolean, String) -> void
                 &[JValue::from(success), JValue::from(&j_msg)],
             );
+        }
+    }
+
+    fn on_event(&self, event: TransferEvent) {
+        if let Ok(mut env) = self.jvm.attach_current_thread() {
+            if let Ok(payload) = serde_json::to_string(&event) {
+                if let Ok(j_payload) = env.new_string(payload) {
+                    let _ = env.call_static_method(
+                        &self.class_ref,
+                        "onTransferEvent",
+                        "(Ljava/lang/String;)V",
+                        &[JValue::from(&j_payload)],
+                    );
+                }
+            }
         }
     }
 }
@@ -124,9 +140,11 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_startDiscovery(
     info!("Android: JNI startDiscovery 被调用");
 
     let jvm = env.get_java_vm().expect("无法获取 JavaVM");
-    let rust_sdk_class = env.find_class("com/yukon/localsend/RustSDK")
+    let rust_sdk_class = env
+        .find_class("com/yukon/localsend/RustSDK")
         .expect("无法找到 RustSDK 类");
-    let class_global_ref = env.new_global_ref(rust_sdk_class)
+    let class_global_ref = env
+        .new_global_ref(rust_sdk_class)
         .expect("无法创建全局引用");
 
     let bridge = AndroidDiscoveryBridge {
@@ -139,12 +157,7 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_startDiscovery(
         .expect("Couldn't get java string!")
         .into();
 
-    core::start_listening(
-        4060,
-        device_name.clone(),
-        device_name,
-        Box::new(bridge)
-    );
+    core::start_listening(4060, device_name.clone(), device_name, Box::new(bridge));
 }
 
 #[unsafe(no_mangle)]
@@ -157,11 +170,7 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_discoverOnce(
         .get_string(&user_alias)
         .expect("Couldn't get java string!")
         .into();
-    core::send_discover_once(
-    4060,
-         device_name.clone(),
-         device_name,
-    )
+    core::send_discover_once(4060, device_name.clone(), device_name)
 }
 
 #[unsafe(no_mangle)]
@@ -171,9 +180,11 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_startFileServer(
     save_dir: JString,
 ) {
     let jvm = env.get_java_vm().expect("无法获取 JavaVM");
-    let rust_sdk_class = env.find_class("com/yukon/localsend/RustSDK")
+    let rust_sdk_class = env
+        .find_class("com/yukon/localsend/RustSDK")
         .expect("无法找到 RustSDK 类");
-    let class_global_ref = env.new_global_ref(rust_sdk_class)
+    let class_global_ref = env
+        .new_global_ref(rust_sdk_class)
         .expect("无法创建全局引用");
 
     let bridge = AndroidTransferBridge {
@@ -186,11 +197,7 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_startFileServer(
         .expect("无法获取保存路径字符串")
         .into();
 
-    core::start_file_server(
-        4061,
-        save_path,
-        Box::new(bridge)
-    );
+    core::start_file_server(4061, save_path, Box::new(bridge));
 }
 
 #[unsafe(no_mangle)]
@@ -199,11 +206,13 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_sendFile(
     _class: JClass,
     target_ip: JString,
     file_path: JString,
-) {
+) -> jstring {
     let jvm = env.get_java_vm().expect("无法获取 JavaVM");
-    let rust_sdk_class = env.find_class("com/yukon/localsend/RustSDK")
+    let rust_sdk_class = env
+        .find_class("com/yukon/localsend/RustSDK")
         .expect("无法找到 RustSDK 类");
-    let class_global_ref = env.new_global_ref(rust_sdk_class)
+    let class_global_ref = env
+        .new_global_ref(rust_sdk_class)
         .expect("无法创建全局引用");
 
     let bridge = AndroidTransferBridge {
@@ -215,11 +224,47 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_sendFile(
     let path: String = env.get_string(&file_path).unwrap().into();
 
     // 假设 4 并行线程
-    core::send_file(
-        ip,
-        4061,
-        path,
-        8,
-        Box::new(bridge)
-    );
+    let transfer_id = core::send_file(ip, 4061, path, 8, Box::new(bridge));
+    env.new_string(transfer_id)
+        .map(|value| value.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_yukon_localsend_RustSDK_cancelTransfer(
+    mut env: JNIEnv,
+    _class: JClass,
+    transfer_id: JString,
+) -> jboolean {
+    let transfer_id: String = env
+        .get_string(&transfer_id)
+        .map(Into::into)
+        .unwrap_or_default();
+    if transfer::cancel_transfer(&transfer_id) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_yukon_localsend_RustSDK_retryTransfer(
+    mut env: JNIEnv,
+    _class: JClass,
+    transfer_id: JString,
+) -> jboolean {
+    let transfer_id: String = env
+        .get_string(&transfer_id)
+        .map(Into::into)
+        .unwrap_or_default();
+    if transfer::retry_transfer(&transfer_id) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_yukon_localsend_RustSDK_stopFileServer(_env: JNIEnv, _class: JClass) {
+    transfer::stop_server();
 }
