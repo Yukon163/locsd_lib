@@ -1,18 +1,19 @@
 use super::events::{
-    EventSubscriber, OfferId, TransferCallback, TransferDirection, TransferEvent, TransferId,
-    TransferState,
+    EventSubscriber, OfferDisposition, OfferId, TransferCallback, TransferDirection, TransferEvent,
+    TransferId, TransferState,
 };
 use super::protocol::FRAME_MAGIC;
-use super::receiver::ReceiverContext;
+use super::receiver::{OfferRegistry, ReceiverContext};
 use super::sender::{self, SendRequest, SenderError, V3SendOutcome};
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 static ENGINE: OnceLock<TransferEngine> = OnceLock::new();
@@ -23,13 +24,22 @@ struct TransferEngine {
     tasks: Arc<Mutex<HashMap<TransferId, TaskEntry>>>,
     server: Mutex<Option<CancellationToken>>,
     subscribers: Arc<RwLock<Vec<EventSubscriber>>>,
-    offer_decisions: Mutex<HashMap<OfferId, bool>>,
+    offers: Arc<OfferRegistry>,
+    device_identity: RwLock<DeviceIdentity>,
 }
 
 #[derive(Clone)]
 struct TaskEntry {
     request: StoredSendRequest,
     cancellation: CancellationToken,
+    finished: watch::Receiver<bool>,
+    retry_pending: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct DeviceIdentity {
+    id: String,
+    name: String,
 }
 
 #[derive(Clone)]
@@ -52,7 +62,8 @@ fn engine() -> &'static TransferEngine {
         tasks: Arc::new(Mutex::new(HashMap::new())),
         server: Mutex::new(None),
         subscribers: Arc::new(RwLock::new(Vec::new())),
-        offer_decisions: Mutex::new(HashMap::new()),
+        offers: Arc::new(OfferRegistry::default()),
+        device_identity: RwLock::new(default_device_identity()),
     })
 }
 
@@ -68,7 +79,11 @@ pub fn start_server(port: u16, save_dir: String, callback: Box<dyn TransferCallb
         subscribers: engine.subscribers.clone(),
     });
     let legacy_callback: Arc<dyn TransferCallback> = callback.clone();
-    let receiver = Arc::new(ReceiverContext::new(PathBuf::from(&save_dir), callback));
+    let receiver = Arc::new(ReceiverContext::new(
+        PathBuf::from(&save_dir),
+        callback,
+        engine.offers.clone(),
+    ));
     engine.runtime.spawn(async move {
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
             Ok(listener) => listener,
@@ -165,27 +180,31 @@ pub fn send_file(
 
 fn spawn_send(stored: StoredSendRequest) {
     let cancellation = CancellationToken::new();
+    let (finished_tx, finished_rx) = watch::channel(false);
     engine().tasks.lock().unwrap().insert(
         stored.transfer_id.clone(),
         TaskEntry {
             request: stored.clone(),
             cancellation: cancellation.clone(),
+            finished: finished_rx,
+            retry_pending: Arc::new(AtomicBool::new(false)),
         },
     );
+    let identity = engine().device_identity.read().unwrap().clone();
     engine().runtime.spawn(async move {
         let request = SendRequest {
             transfer_id: stored.transfer_id.clone(),
             target_ip: stored.target_ip.clone(),
             port: stored.port,
             file_path: stored.file_path.clone(),
-            sender_device_id: format!("device-{}", std::process::id()),
-            sender_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "LocalSend".into()),
+            sender_device_id: identity.id,
+            sender_name: identity.name,
             callback: stored.callback.clone(),
         };
         match sender::send_v3(request, cancellation.clone()).await {
             Ok(V3SendOutcome::Completed(_)) => {}
-            Ok(V3SendOutcome::Unsupported) => {
-                info!("peer explicitly reported V3 unsupported; entering V2 compatibility layer");
+            Ok(V3SendOutcome::CompatibilityRequired) => {
+                info!("peer did not complete the V3 pre-offer handshake; entering V2 compatibility layer");
                 if let Err(message) = run_compatibility_fallback(&stored).await {
                     stored.callback.on_complete(false, message);
                 }
@@ -203,6 +222,7 @@ fn spawn_send(stored: StoredSendRequest) {
                 stored.callback.on_event(event);
             }
         }
+        finished_tx.send_replace(true);
     });
 }
 
@@ -246,8 +266,21 @@ pub fn cancel_transfer(transfer_id: &str) -> bool {
 pub fn retry_transfer(transfer_id: &str) -> bool {
     let entry = engine().tasks.lock().unwrap().get(transfer_id).cloned();
     if let Some(entry) = entry {
+        if entry
+            .retry_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
         entry.cancellation.cancel();
-        spawn_send(entry.request);
+        engine().runtime.spawn(async move {
+            let mut finished = entry.finished.clone();
+            if !*finished.borrow() {
+                let _ = finished.changed().await;
+            }
+            spawn_send(entry.request);
+        });
         true
     } else {
         false
@@ -258,23 +291,49 @@ pub fn subscribe_events(subscriber: EventSubscriber) {
     engine().subscribers.write().unwrap().push(subscriber);
 }
 
-pub fn accept_transfer(offer_id: &str, _destination: String) -> bool {
-    let mut decisions = engine().offer_decisions.lock().unwrap();
-    if let Some(decision) = decisions.get_mut(offer_id) {
-        *decision = true;
-        true
-    } else {
-        false
-    }
+pub fn accept_transfer(offer_id: &str, destination: String) -> bool {
+    engine().offers.accept(offer_id, PathBuf::from(destination))
 }
 
 pub fn reject_transfer(offer_id: &str) -> bool {
-    let mut decisions = engine().offer_decisions.lock().unwrap();
-    if let Some(decision) = decisions.get_mut(offer_id) {
-        *decision = false;
-        true
-    } else {
-        false
+    engine().offers.reject(offer_id)
+}
+
+pub fn configure_device_identity(device_id: String, device_name: String) -> bool {
+    let device_id = device_id.trim();
+    if device_id.is_empty() {
+        return false;
+    }
+    let mut identity = engine().device_identity.write().unwrap();
+    identity.id = device_id.to_string();
+    if !device_name.trim().is_empty() {
+        identity.name = device_name;
+    }
+    true
+}
+
+fn default_device_identity() -> DeviceIdentity {
+    let machine = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown-host".into());
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_default();
+    let seed = format!(
+        "{}|{}|{}|{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        machine,
+        user
+    );
+    let digest = blake3::hash(seed.as_bytes()).to_hex();
+    DeviceIdentity {
+        id: format!("device-{}", &digest[..32]),
+        name: if machine == "unknown-host" {
+            "LocalSend".into()
+        } else {
+            machine
+        },
     }
 }
 
@@ -320,6 +379,16 @@ impl TransferCallback for FanoutCallback {
     }
     fn on_progress(&self, transferred: u64, total: u64) {
         self.inner.on_progress(transferred, total);
+    }
+    fn on_offer(
+        &self,
+        offer_id: OfferId,
+        file_name: String,
+        file_size: u64,
+        sender_ip: String,
+    ) -> OfferDisposition {
+        self.inner
+            .on_offer(offer_id, file_name, file_size, sender_ip)
     }
     fn on_complete(&self, success: bool, msg: String) {
         self.inner.on_complete(success, msg);
@@ -367,6 +436,16 @@ impl TransferCallback for TaskCallback {
         event.durable_bytes = transferred.min(total);
         self.fanout(event);
     }
+    fn on_offer(
+        &self,
+        offer_id: OfferId,
+        file_name: String,
+        file_size: u64,
+        sender_ip: String,
+    ) -> OfferDisposition {
+        self.inner
+            .on_offer(offer_id, file_name, file_size, sender_ip)
+    }
     fn on_complete(&self, success: bool, msg: String) {
         let state = if success {
             TransferState::Completed
@@ -393,10 +472,158 @@ impl TransferCallback for TaskCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
 
     struct TestCallback {
         completed: Mutex<mpsc::Sender<bool>>,
+    }
+
+    #[test]
+    fn fallback_device_identity_is_stable_and_process_independent() {
+        let first = default_device_identity();
+        let second = default_device_identity();
+        assert_eq!(first.id, second.id);
+        assert!(first.id.starts_with("device-"));
+        assert_eq!(first.id.len(), "device-".len() + 32);
+    }
+
+    #[test]
+    fn new_sender_falls_back_to_an_old_v2_only_receiver() {
+        let root = std::env::temp_dir().join(format!("locsd-v2-e2e-{}", new_transfer_id()));
+        let source_dir = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        let content = vec![0x5a; 100 * 1024 + 13];
+        let source = source_dir.join("old-peer.bin");
+        std::fs::write(&source, &content).unwrap();
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let (receive_tx, receive_rx) = mpsc::channel();
+        let receiver_callback: Arc<dyn TransferCallback> = Arc::new(TestCallback {
+            completed: Mutex::new(receive_tx),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let save_dir = Arc::new(destination.to_string_lossy().into_owned());
+        let server = std::thread::spawn(move || {
+            let progress = Arc::new(Mutex::new(0u64));
+            let total = Arc::new(Mutex::new(0u64));
+            while !server_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((socket, _)) => {
+                        let save_dir = save_dir.clone();
+                        let callback = receiver_callback.clone();
+                        let progress = progress.clone();
+                        let total = total.clone();
+                        std::thread::spawn(move || {
+                            crate::core::handle_incoming_connection(
+                                socket, save_dir, callback, progress, total,
+                            );
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("old receiver accept failed: {error}"),
+                }
+            }
+        });
+
+        let (send_tx, send_rx) = mpsc::channel();
+        send_file(
+            "127.0.0.1".into(),
+            port,
+            source.to_string_lossy().into_owned(),
+            Box::new(TestCallback {
+                completed: Mutex::new(send_tx),
+            }),
+        );
+        assert!(send_rx.recv_timeout(Duration::from_secs(30)).unwrap());
+        assert!(receive_rx.recv_timeout(Duration::from_secs(30)).unwrap());
+        assert_eq!(
+            std::fs::read(destination.join("old-peer.bin")).unwrap(),
+            content
+        );
+
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retry_waits_for_the_previous_task_and_coalesces_duplicate_requests() {
+        let root = std::env::temp_dir().join(format!("locsd-retry-{}", new_transfer_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("retry.bin");
+        std::fs::write(&source, b"retry").unwrap();
+        let transfer_id = new_transfer_id();
+        let (completed, completion) = mpsc::channel();
+        let request = StoredSendRequest {
+            transfer_id: transfer_id.clone(),
+            target_ip: "127.0.0.1".into(),
+            port: 1,
+            file_path: source,
+            callback: Arc::new(TestCallback {
+                completed: Mutex::new(completed),
+            }),
+        };
+        let cancellation = CancellationToken::new();
+        let (finished_tx, finished_rx) = watch::channel(false);
+        let original_retry_flag = Arc::new(AtomicBool::new(false));
+        engine().tasks.lock().unwrap().insert(
+            transfer_id.clone(),
+            TaskEntry {
+                request,
+                cancellation,
+                finished: finished_rx,
+                retry_pending: original_retry_flag.clone(),
+            },
+        );
+
+        assert!(retry_transfer(&transfer_id));
+        assert!(!retry_transfer(&transfer_id));
+        std::thread::sleep(Duration::from_millis(50));
+        let before_finish = engine()
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&transfer_id)
+            .unwrap()
+            .retry_pending
+            .clone();
+        assert!(Arc::ptr_eq(&before_finish, &original_retry_flag));
+
+        finished_tx.send_replace(true);
+        for _ in 0..100 {
+            let current = engine()
+                .tasks
+                .lock()
+                .unwrap()
+                .get(&transfer_id)
+                .unwrap()
+                .retry_pending
+                .clone();
+            if !Arc::ptr_eq(&current, &original_retry_flag) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let after_finish = engine()
+            .tasks
+            .lock()
+            .unwrap()
+            .get(&transfer_id)
+            .unwrap()
+            .retry_pending
+            .clone();
+        assert!(!Arc::ptr_eq(&after_finish, &original_retry_flag));
+        assert!(!completion.recv_timeout(Duration::from_secs(5)).unwrap());
+        engine().tasks.lock().unwrap().remove(&transfer_id);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     impl TransferCallback for TestCallback {

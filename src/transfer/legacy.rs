@@ -1,8 +1,9 @@
 //! Compatibility boundary for the fixed-chunk V2 and original text protocol.
 //!
-//! New code enters this module only after the peer explicitly reports V3 as
-//! unsupported. The implementation remains isolated from the adaptive V3
-//! scheduler so fixed chunk indexes can never be mistaken for arbitrary ranges.
+//! New code enters this module only before an offer has been sent, when the peer
+//! explicitly rejects V3 or cannot complete a V3 hello. The implementation
+//! remains isolated from the adaptive V3 scheduler so fixed chunk indexes can
+//! never be mistaken for arbitrary ranges.
 
 use super::TransferCallback;
 use std::net::TcpStream;

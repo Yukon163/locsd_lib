@@ -5,6 +5,13 @@ use std::time::Duration;
 pub type TransferId = String;
 pub type OfferId = String;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OfferDisposition {
+    Accept,
+    Reject,
+    Pending,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TransferDirection {
@@ -75,6 +82,21 @@ pub trait TransferCallback: Send + Sync {
     fn on_receive_request(&self, file_name: String, file_size: u64, sender_ip: String) -> bool;
     fn on_progress(&self, transferred: u64, total: u64);
     fn on_complete(&self, success: bool, msg: String);
+
+    fn on_offer(
+        &self,
+        offer_id: OfferId,
+        file_name: String,
+        file_size: u64,
+        sender_ip: String,
+    ) -> OfferDisposition {
+        let _ = offer_id;
+        if self.on_receive_request(file_name, file_size, sender_ip) {
+            OfferDisposition::Accept
+        } else {
+            OfferDisposition::Reject
+        }
+    }
 
     fn on_event(&self, event: TransferEvent) {
         match event.state {

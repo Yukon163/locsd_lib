@@ -28,6 +28,9 @@ pub struct ActiveRange {
     pub committed_end: u64,
     pub started_at: Instant,
     pub bytes_sent: u64,
+    pub last_sample_at: Instant,
+    pub last_sample_bytes: u64,
+    pub ewma_speed_bytes_per_second: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -90,8 +93,12 @@ impl AdaptiveScheduler {
             rollback_ranges: HashSet::new(),
             rollback_intervals: Vec::new(),
         };
+        let total_missing: u64 = missing.iter().map(|range| range.len()).sum();
+        let initial_range_size = total_missing
+            .div_ceil(scheduler.target.max(1) as u64)
+            .max(NORMAL_MIN_RANGE);
         for interval in missing {
-            for piece in divide_interval(interval, NORMAL_MIN_RANGE) {
+            for piece in divide_interval(interval, initial_range_size) {
                 let task = scheduler.new_task(piece, 0, 0);
                 scheduler.pending.push_back(task);
             }
@@ -144,14 +151,18 @@ impl AdaptiveScheduler {
             return None;
         }
         let task = self.pending.pop_front()?;
+        let now = Instant::now();
         self.active.insert(
             task.range_id,
             ActiveRange {
                 task: task.clone(),
                 worker_id,
                 committed_end: task.interval.start,
-                started_at: Instant::now(),
+                started_at: now,
                 bytes_sent: 0,
+                last_sample_at: now,
+                last_sample_bytes: 0,
+                ewma_speed_bytes_per_second: 0.0,
             },
         );
         Some(task)
@@ -159,7 +170,21 @@ impl AdaptiveScheduler {
 
     pub fn record_in_flight(&mut self, range_id: u64, bytes_sent: u64) {
         if let Some(active) = self.active.get_mut(&range_id) {
-            active.bytes_sent = bytes_sent.min(active.task.interval.len());
+            let bytes_sent = bytes_sent.min(active.task.interval.len());
+            let now = Instant::now();
+            let elapsed = now.duration_since(active.last_sample_at);
+            let delta = bytes_sent.saturating_sub(active.last_sample_bytes);
+            if delta > 0 && elapsed >= Duration::from_millis(20) {
+                let sample = delta as f64 / elapsed.as_secs_f64();
+                active.ewma_speed_bytes_per_second = if active.ewma_speed_bytes_per_second == 0.0 {
+                    sample
+                } else {
+                    active.ewma_speed_bytes_per_second * 0.7 + sample * 0.3
+                };
+                active.last_sample_at = now;
+                active.last_sample_bytes = bytes_sent;
+            }
+            active.bytes_sent = bytes_sent;
         }
     }
 
@@ -376,12 +401,8 @@ impl AdaptiveScheduler {
                     .get(&active.task.root_range_id)
                     .is_none_or(|until| *until <= Instant::now())
             })
-            .max_by_key(|active| {
-                active
-                    .task
-                    .interval
-                    .end
-                    .saturating_sub(active.task.interval.start + active.bytes_sent)
+            .max_by(|left, right| {
+                estimated_remaining_seconds(left).total_cmp(&estimated_remaining_seconds(right))
             })
             .map(|active| active.task.range_id)
     }
@@ -392,6 +413,29 @@ impl AdaptiveScheduler {
             >= self
                 .minimum_range()
                 .saturating_mul((self.target + 1) as u64)
+    }
+}
+
+fn estimated_remaining_seconds(active: &ActiveRange) -> f64 {
+    let remaining = active
+        .task
+        .interval
+        .end
+        .saturating_sub(active.task.interval.start + active.bytes_sent);
+    let average_speed = if active.started_at.elapsed().is_zero() {
+        0.0
+    } else {
+        active.bytes_sent as f64 / active.started_at.elapsed().as_secs_f64()
+    };
+    let speed = if active.ewma_speed_bytes_per_second > 0.0 {
+        active.ewma_speed_bytes_per_second
+    } else {
+        average_speed
+    };
+    if speed > 0.0 {
+        remaining as f64 / speed
+    } else {
+        f64::INFINITY
     }
 }
 
@@ -431,6 +475,44 @@ mod tests {
             ));
         }
         assert!(scheduler.target() <= 12);
+    }
+
+    #[test]
+    fn initial_partition_creates_broad_ranges_for_the_initial_workers() {
+        let scheduler = AdaptiveScheduler::new(
+            128 * NORMAL_MIN_RANGE,
+            vec![Interval {
+                start: 0,
+                end: 128 * NORMAL_MIN_RANGE,
+            }],
+            12,
+        );
+        assert_eq!(scheduler.pending_len(), INITIAL_CONCURRENCY);
+    }
+
+    #[test]
+    fn split_candidate_uses_remaining_eta_instead_of_remaining_bytes() {
+        let mut scheduler = AdaptiveScheduler::new(
+            64 * NORMAL_MIN_RANGE,
+            vec![Interval {
+                start: 0,
+                end: 64 * NORMAL_MIN_RANGE,
+            }],
+            8,
+        );
+        let slow = scheduler.take_next(0).unwrap();
+        let fast = scheduler.take_next(1).unwrap();
+        for active in scheduler.active.values_mut() {
+            active.started_at = Instant::now() - Duration::from_secs(2);
+            active.bytes_sent = NORMAL_MIN_RANGE;
+            active.ewma_speed_bytes_per_second = if active.task.range_id == slow.range_id {
+                1.0
+            } else {
+                10_000_000.0
+            };
+        }
+        assert_eq!(scheduler.longest_splittable_range(), Some(slow.range_id));
+        assert_ne!(slow.range_id, fast.range_id);
     }
 
     #[test]

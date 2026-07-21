@@ -4,8 +4,8 @@ use super::events::{
 use super::identity::{FileIdentity, SourceSnapshot, identify_file};
 use super::metrics::MetricsCollector;
 use super::protocol::{
-    self, Ack3, AckStatus, ConnectionRole, Done3, Error3, Final3, FrameKind, Hello3, Offer3,
-    Pause3, Plan3, ProtocolError, Range3,
+    self, Ack3, AckStatus, ConnectionRole, Done3, Error3, Final3, FrameKind, Hello3, Invalidate3,
+    Offer3, Pause3, Plan3, ProtocolError, Range3,
 };
 use super::range::{Interval, IntervalSet};
 use super::scheduler::{
@@ -13,6 +13,7 @@ use super::scheduler::{
 };
 use blake3::Hasher;
 use log::{debug, info};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,7 +42,7 @@ pub struct SendRequest {
 
 pub enum V3SendOutcome {
     Completed(Done3),
-    Unsupported,
+    CompatibilityRequired,
 }
 
 pub async fn send_v3(
@@ -106,16 +107,24 @@ pub async fn send_v3(
             "pause".into(),
             "blake3".into(),
             "resume".into(),
+            "invalidate".into(),
         ],
         receiver_max_concurrency: MAX_CONCURRENCY as u16,
         session_token: None,
     };
-    protocol::write_control(&mut control, FrameKind::Hello, &hello).await?;
+    if protocol::write_control(&mut control, FrameKind::Hello, &hello)
+        .await
+        .is_err()
+    {
+        return Ok(V3SendOutcome::CompatibilityRequired);
+    }
     match timeout(HANDSHAKE_TIMEOUT, read_hello_response(&mut control)).await {
         Ok(Ok(HelloResponse::Hello)) => {}
-        Ok(Ok(HelloResponse::Unsupported)) => return Ok(V3SendOutcome::Unsupported),
-        Ok(Err(error)) => return Err(error),
-        Err(_) => return Err(SenderError::HandshakeTimeout),
+        Ok(Ok(HelloResponse::Unsupported)) | Err(_) => {
+            return Ok(V3SendOutcome::CompatibilityRequired);
+        }
+        Ok(Err(error @ SenderError::Remote(_, _))) => return Err(error),
+        Ok(Err(_)) => return Ok(V3SendOutcome::CompatibilityRequired),
     }
 
     let offer = Offer3 {
@@ -210,6 +219,7 @@ pub async fn send_v3(
     Ok(V3SendOutcome::Completed(done))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn transfer_ranges(
     request: &SendRequest,
     identity: &FileIdentity,
@@ -229,12 +239,13 @@ async fn transfer_ranges(
         receiver_limit,
     )));
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let mut controls: Vec<mpsc::UnboundedSender<WorkerControl>> = Vec::new();
-    let mut worker_count = 0usize;
+    let mut controls: HashMap<usize, mpsc::UnboundedSender<WorkerControl>> = HashMap::new();
+    let mut retiring = HashSet::new();
+    let mut next_worker_id = 0usize;
     let initial = scheduler.lock().await.target();
     for _ in 0..initial {
         spawn_worker(
-            worker_count,
+            next_worker_id,
             request,
             session_token,
             identity.snapshot.clone(),
@@ -243,17 +254,19 @@ async fn transfer_ranges(
             &mut controls,
             cancellation.clone(),
         );
-        worker_count += 1;
+        next_worker_id += 1;
     }
 
     let mut metrics = MetricsCollector::new();
     let mut scheduler_tick = interval(SCHEDULER_TICK);
     let mut metrics_tick = interval(DIAGNOSTIC_WINDOW);
+    scheduler_tick.tick().await;
+    metrics_tick.tick().await;
     let mut fatal: Option<SenderError> = None;
     loop {
         tokio::select! {
             _ = cancellation.cancelled() => {
-                for control in &controls { let _ = control.send(WorkerControl::Retire); }
+                stop_workers(&mut controls, &mut event_rx).await;
                 return Err(SenderError::Cancelled);
             }
             Some(event) = event_rx.recv() => {
@@ -270,6 +283,8 @@ async fn transfer_ranges(
                     }
                     WorkerEvent::Stopped { worker_id } => {
                         debug!("V3 worker {worker_id} stopped");
+                        controls.remove(&worker_id);
+                        retiring.remove(&worker_id);
                     }
                 }
             }
@@ -283,7 +298,11 @@ async fn transfer_ranges(
                 );
                 if locked.is_complete() { break; }
                 drop(locked);
-                if let Some(error) = fatal.take() { return Err(error); }
+                if let Some(error) = fatal.take() {
+                    cancellation.cancel();
+                    stop_workers(&mut controls, &mut event_rx).await;
+                    return Err(error);
+                }
             }
             _ = metrics_tick.tick() => {
                 let (active, pending) = {
@@ -306,32 +325,51 @@ async fn transfer_ranges(
                     scheduler.lock().await.target(),
                 );
                 for _ in 0..decision.spawn_workers {
-                    if worker_count >= MAX_CONCURRENCY { break; }
+                    if controls.len() >= MAX_CONCURRENCY { break; }
                     spawn_worker(
-                        worker_count, request, session_token, identity.snapshot.clone(), scheduler.clone(),
+                        next_worker_id, request, session_token, identity.snapshot.clone(), scheduler.clone(),
                         event_tx.clone(), &mut controls, cancellation.clone(),
                     );
-                    worker_count += 1;
+                    next_worker_id += 1;
                 }
                 if decision.retire_workers > 0 {
-                    for control in controls.iter().rev().take(decision.retire_workers) {
-                        let _ = control.send(WorkerControl::Retire);
+                    let candidates: Vec<_> = controls
+                        .keys()
+                        .filter(|worker_id| !retiring.contains(*worker_id))
+                        .copied()
+                        .take(decision.retire_workers)
+                        .collect();
+                    for worker_id in candidates {
+                        if let Some(control) = controls.get(&worker_id) {
+                            let _ = control.send(WorkerControl::Retire);
+                            retiring.insert(worker_id);
+                        }
                     }
                 }
-                if let Some(range_id) = decision.pause_for_split.or_else(|| {
+                let split_candidate = decision.pause_for_split.or_else(|| {
                     if pending == 0 { scheduler.try_lock().ok().and_then(|locked| locked.tail_rescue_candidate()) } else { None }
-                }) {
-                    if let Some(worker_id) = scheduler.lock().await.worker_for_range(range_id) {
-                        if let Some(control) = controls.get(worker_id) { let _ = control.send(WorkerControl::Pause(range_id)); }
-                    }
+                });
+                let split_control = if let Some(range_id) = split_candidate {
+                    scheduler.lock().await.worker_for_range(range_id)
+                        .and_then(|worker_id| controls.get(&worker_id))
+                        .map(|control| (control, range_id))
+                } else {
+                    None
+                };
+                if let Some((control, range_id)) = split_control {
+                    let _ = control.send(WorkerControl::Pause(range_id));
                 }
                 if !decision.rollback_children.is_empty() {
                     let workers = scheduler.lock().await.start_rollback(&decision.rollback_children);
                     for worker_id in workers {
-                        if let Some(control) = controls.get(worker_id) {
-                            if let Some(range_id) = decision.rollback_children.iter().copied().find(|id| {
-                                scheduler.try_lock().ok().and_then(|locked| locked.worker_for_range(*id)) == Some(worker_id)
-                            }) { let _ = control.send(WorkerControl::Pause(range_id)); }
+                        let range_id = decision.rollback_children.iter().copied().find(|id| {
+                            scheduler.try_lock().ok().and_then(|locked| locked.worker_for_range(*id)) == Some(worker_id)
+                        });
+                        if let Some((control, range_id)) = controls
+                            .get(&worker_id)
+                            .zip(range_id)
+                        {
+                            let _ = control.send(WorkerControl::Pause(range_id));
                         }
                     }
                 }
@@ -351,12 +389,29 @@ async fn transfer_ranges(
             }
         }
     }
-    for control in &controls {
-        let _ = control.send(WorkerControl::Retire);
-    }
+    stop_workers(&mut controls, &mut event_rx).await;
     Ok(())
 }
 
+async fn stop_workers(
+    controls: &mut HashMap<usize, mpsc::UnboundedSender<WorkerControl>>,
+    event_rx: &mut mpsc::UnboundedReceiver<WorkerEvent>,
+) {
+    for control in controls.values() {
+        let _ = control.send(WorkerControl::Retire);
+    }
+    while !controls.is_empty() {
+        match event_rx.recv().await {
+            Some(WorkerEvent::Stopped { worker_id }) => {
+                controls.remove(&worker_id);
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_worker(
     worker_id: usize,
     request: &SendRequest,
@@ -364,11 +419,11 @@ fn spawn_worker(
     snapshot: SourceSnapshot,
     scheduler: Arc<Mutex<AdaptiveScheduler>>,
     event_tx: mpsc::UnboundedSender<WorkerEvent>,
-    controls: &mut Vec<mpsc::UnboundedSender<WorkerControl>>,
+    controls: &mut HashMap<usize, mpsc::UnboundedSender<WorkerControl>>,
     cancellation: CancellationToken,
 ) {
     let (control_tx, control_rx) = mpsc::unbounded_channel();
-    controls.push(control_tx);
+    controls.insert(worker_id, control_tx);
     let target_ip = request.target_ip.clone();
     let token = session_token.to_string();
     let port = request.port;
@@ -389,6 +444,7 @@ fn spawn_worker(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn data_worker(
     worker_id: usize,
     target_ip: String,
@@ -420,7 +476,11 @@ async fn data_worker(
             continue;
         };
         if stream.is_none() {
-            match connect_data(&target_ip, port, &session_token).await {
+            let connected = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                result = connect_data(&target_ip, port, &session_token) => result,
+            };
+            match connected {
                 Ok(connected) => stream = Some(connected),
                 Err(error) => {
                     let timeout_or_reset = error.is_timeout_or_reset();
@@ -434,15 +494,17 @@ async fn data_worker(
                 }
             }
         }
-        let result = send_range(
-            stream.as_mut().unwrap(),
-            &snapshot,
-            &task,
-            &scheduler,
-            &mut controls,
-            &cancellation,
-        )
-        .await;
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => return,
+            result = send_range(
+                stream.as_mut().unwrap(),
+                &snapshot,
+                &task,
+                &scheduler,
+                &mut controls,
+                &cancellation,
+            ) => result,
+        };
         match result {
             Ok(result) => {
                 retire |= result.retire;
@@ -478,7 +540,12 @@ async fn connect_data(
     let hello = Hello3 {
         protocol_version: protocol::PROTOCOL_VERSION,
         role: ConnectionRole::Data,
-        capabilities: vec!["range".into(), "ack".into(), "pause".into()],
+        capabilities: vec![
+            "range".into(),
+            "ack".into(),
+            "pause".into(),
+            "invalidate".into(),
+        ],
         receiver_max_concurrency: 0,
         session_token: Some(session_token.into()),
     };
@@ -574,18 +641,39 @@ async fn read_ack(
         return Err(SenderError::InvalidAck);
     }
     match ack.status {
-        AckStatus::Committed => {
+        AckStatus::Committed | AckStatus::Duplicate => {
             let expected_hash = hasher.clone().finalize().to_hex().to_string();
             if ack.range_hash != expected_hash {
+                invalidate_range(stream, task).await?;
                 return Err(SenderError::RangeHashMismatch);
             }
         }
-        AckStatus::Duplicate => {}
         AckStatus::Rejected => {
             return Err(SenderError::RangeRejected(ack.message.unwrap_or_default()));
         }
     }
     Ok(ack)
+}
+
+async fn invalidate_range(stream: &mut TcpStream, task: &RangeTask) -> Result<(), SenderError> {
+    let invalidate = Invalidate3 {
+        range_id: task.range_id,
+        start: task.interval.start,
+        end: task.interval.end,
+        generation: task.generation,
+        reason: "range hash mismatch".into(),
+    };
+    protocol::write_control(stream, FrameKind::Invalidate, &invalidate).await?;
+    let ack: Ack3 = timeout(ACK_TIMEOUT, protocol::read_control(stream, FrameKind::Ack))
+        .await
+        .map_err(|_| SenderError::AckTimeout)??;
+    if ack.range_id != task.range_id
+        || ack.committed_end != task.interval.start
+        || ack.status != AckStatus::Committed
+    {
+        return Err(SenderError::RangeInvalidationFailed);
+    }
+    Ok(())
 }
 
 fn validate_plan(plan: &Plan3, total_bytes: u64) -> Result<IntervalSet, SenderError> {
@@ -627,6 +715,7 @@ async fn read_hello_response(stream: &mut TcpStream) -> Result<HelloResponse, Se
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit(
     request: &SendRequest,
     state: TransferState,
@@ -708,6 +797,7 @@ pub enum SenderError {
     InvalidPlan,
     InvalidAck,
     RangeHashMismatch,
+    RangeInvalidationFailed,
     RangeRejected(String),
     SourceChanged,
     UnexpectedSourceEof,
@@ -725,6 +815,7 @@ impl SenderError {
             Self::InvalidPlan => "invalid_plan",
             Self::InvalidAck => "invalid_ack",
             Self::RangeHashMismatch => "range_hash_mismatch",
+            Self::RangeInvalidationFailed => "range_invalidation_failed",
             Self::RangeRejected(_) => "range_rejected",
             Self::SourceChanged => "source_changed",
             Self::UnexpectedSourceEof => "source_eof",
@@ -764,5 +855,114 @@ impl From<io::Error> for SenderError {
 impl From<serde_json::Error> for SenderError {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    struct NoopCallback;
+
+    impl TransferCallback for NoopCallback {
+        fn on_receive_request(
+            &self,
+            _file_name: String,
+            _file_size: u64,
+            _sender_ip: String,
+        ) -> bool {
+            true
+        }
+
+        fn on_progress(&self, _transferred: u64, _total: u64) {}
+        fn on_complete(&self, _success: bool, _msg: String) {}
+    }
+
+    #[tokio::test]
+    async fn pre_offer_hello_timeout_requests_v2_compatibility() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut prefix = [0u8; 4];
+            stream.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(prefix, protocol::FRAME_MAGIC);
+            tokio::time::sleep(HANDSHAKE_TIMEOUT + Duration::from_millis(100)).await;
+        });
+
+        let root = std::env::temp_dir().join(format!("locsd-v2-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        std::fs::write(&source, b"compatibility-check").unwrap();
+        let request = SendRequest {
+            transfer_id: "fallback-test".into(),
+            target_ip: "127.0.0.1".into(),
+            port,
+            file_path: source,
+            sender_device_id: "stable-test-device".into(),
+            sender_name: "test".into(),
+            callback: Arc::new(NoopCallback),
+        };
+        let outcome = send_v3(request, CancellationToken::new()).await.unwrap();
+        assert!(matches!(outcome, V3SendOutcome::CompatibilityRequired));
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hash_mismatch_invalidates_the_entire_scheduled_range_before_retry() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let bad_ack = Ack3 {
+                range_id: 7,
+                committed_end: 150,
+                range_hash: "corrupt".into(),
+                status: AckStatus::Committed,
+                message: None,
+            };
+            protocol::write_control(&mut stream, FrameKind::Ack, &bad_ack)
+                .await
+                .unwrap();
+            let invalidate: Invalidate3 =
+                protocol::read_control(&mut stream, FrameKind::Invalidate)
+                    .await
+                    .unwrap();
+            assert_eq!(invalidate.start, 100);
+            assert_eq!(invalidate.end, 200);
+            let ack = Ack3 {
+                range_id: invalidate.range_id,
+                committed_end: invalidate.start,
+                range_hash: String::new(),
+                status: AckStatus::Committed,
+                message: None,
+            };
+            protocol::write_control(&mut stream, FrameKind::Ack, &ack)
+                .await
+                .unwrap();
+        });
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let task = RangeTask {
+            range_id: 7,
+            interval: Interval {
+                start: 100,
+                end: 200,
+            },
+            generation: 2,
+            attempts: 0,
+            root_range_id: 7,
+            created_at: Instant::now(),
+        };
+        let mut hasher = Hasher::new();
+        hasher.update(b"expected bytes");
+        let error = read_ack(&mut stream, &task, 150, &hasher)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SenderError::RangeHashMismatch));
+        server.await.unwrap();
     }
 }

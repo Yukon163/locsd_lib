@@ -1,5 +1,7 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)] // C ABI validates pointers before dereferencing them.
+
 use crate::core::{self, DeviceInfo, DiscoveryCallback, TransferCallback};
-use crate::transfer::{self, TransferEvent};
+use crate::transfer::{self, OfferDisposition, OfferId, TransferEvent};
 use log::info;
 use serde_json::json;
 use std::ffi::{CStr, CString, c_char};
@@ -75,6 +77,27 @@ impl TransferCallback for FlutterTransferBridge {
                 "total": total,
             }),
         );
+    }
+
+    fn on_offer(
+        &self,
+        offer_id: OfferId,
+        file_name: String,
+        file_size: u64,
+        sender_ip: String,
+    ) -> OfferDisposition {
+        emit_json(
+            self.on_event,
+            json!({
+                "type": "receiveRequest",
+                "direction": self.direction,
+                "offerId": offer_id,
+                "fileName": file_name,
+                "fileSize": file_size,
+                "senderIp": sender_ip,
+            }),
+        );
+        OfferDisposition::Pending
     }
 
     fn on_complete(&self, success: bool, msg: String) {
@@ -190,6 +213,17 @@ pub extern "C" fn rust_flutter_cancel_transfer(transfer_id: *const c_char) -> bo
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_flutter_retry_transfer(transfer_id: *const c_char) -> bool {
     transfer::retry_transfer(&c_string_arg(transfer_id, ""))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_flutter_configure_device_identity(
+    device_id: *const c_char,
+    device_name: *const c_char,
+) -> bool {
+    transfer::configure_device_identity(
+        c_string_arg(device_id, ""),
+        c_string_arg(device_name, "Flutter"),
+    )
 }
 
 #[unsafe(no_mangle)]

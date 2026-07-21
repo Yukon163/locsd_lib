@@ -233,7 +233,7 @@ fn total_chunks(size: u64, chunk_size: u64) -> usize {
     if size == 0 {
         1
     } else {
-        ((size + chunk_size - 1) / chunk_size) as usize
+        size.div_ceil(chunk_size) as usize
     }
 }
 
@@ -360,10 +360,10 @@ fn parse_chunk_ranges(input: &str) -> Vec<usize> {
     let mut chunks = Vec::new();
     for part in input.split(',').filter(|part| !part.is_empty()) {
         if let Some((start, end)) = part.split_once('-') {
-            if let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>()) {
-                if start <= end {
-                    chunks.extend(start..=end);
-                }
+            if let (Ok(start), Ok(end)) = (start.parse::<usize>(), end.parse::<usize>())
+                && start <= end
+            {
+                chunks.extend(start..=end);
             }
         } else if let Ok(idx) = part.parse::<usize>() {
             chunks.push(idx);
@@ -558,6 +558,7 @@ fn handle_resume_request(
 
     match OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(&part_file_path)
     {
@@ -989,6 +990,7 @@ pub(crate) fn send_file_legacy_inner(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_chunk(
     ip: &str,
     port: u16,
@@ -1031,6 +1033,7 @@ fn send_chunk(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_chunk_v2(
     ip: &str,
     port: u16,

@@ -110,6 +110,45 @@ impl TransferMeta {
         Ok(())
     }
 
+    pub fn invalidate(&mut self, interval: Interval) -> io::Result<bool> {
+        if interval.is_empty() || interval.end > self.total_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid interval to invalidate",
+            ));
+        }
+        let mut changed = false;
+        let mut retained = Vec::with_capacity(self.completed_intervals.len() + 1);
+        for completed in self.completed_intervals.drain(..) {
+            let current = completed.interval();
+            if !current.overlaps(interval) {
+                retained.push(completed);
+                continue;
+            }
+            changed = true;
+            if current.start < interval.start {
+                retained.push(CompletedInterval {
+                    start: current.start,
+                    end: interval.start,
+                    hash: String::new(),
+                });
+            }
+            if current.end > interval.end {
+                retained.push(CompletedInterval {
+                    start: interval.end,
+                    end: current.end,
+                    hash: String::new(),
+                });
+            }
+        }
+        retained.sort_by_key(|entry| entry.start);
+        self.completed_intervals = retained;
+        if changed {
+            self.updated_at = timestamp_ms();
+        }
+        Ok(changed)
+    }
+
     fn compact_if_needed(&mut self) {
         if self.completed_intervals.len() <= MAX_COMPLETED_INTERVALS {
             return;
@@ -214,6 +253,31 @@ mod tests {
         assert!(
             meta.commit(Interval { start: 25, end: 75 }, "overlap".into())
                 .is_err()
+        );
+        assert_eq!(meta.durable_bytes(), 50);
+    }
+
+    #[test]
+    fn invalidating_a_bad_subrange_preserves_only_disjoint_durable_bytes() {
+        let mut meta = TransferMeta::new(
+            "key".into(),
+            "sender".into(),
+            "file".into(),
+            100,
+            "hash".into(),
+        );
+        meta.commit(Interval { start: 0, end: 100 }, "whole".into())
+            .unwrap();
+        assert!(meta.invalidate(Interval { start: 25, end: 75 }).unwrap());
+        assert_eq!(
+            meta.completed_set().as_slice(),
+            &[
+                Interval { start: 0, end: 25 },
+                Interval {
+                    start: 75,
+                    end: 100
+                }
+            ]
         );
         assert_eq!(meta.durable_bytes(), 50);
     }

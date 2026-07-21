@@ -111,17 +111,16 @@ impl TransferCallback for AndroidTransferBridge {
     }
 
     fn on_event(&self, event: TransferEvent) {
-        if let Ok(mut env) = self.jvm.attach_current_thread() {
-            if let Ok(payload) = serde_json::to_string(&event) {
-                if let Ok(j_payload) = env.new_string(payload) {
-                    let _ = env.call_static_method(
-                        &self.class_ref,
-                        "onTransferEvent",
-                        "(Ljava/lang/String;)V",
-                        &[JValue::from(&j_payload)],
-                    );
-                }
-            }
+        if let Ok(mut env) = self.jvm.attach_current_thread()
+            && let Ok(payload) = serde_json::to_string(&event)
+            && let Ok(j_payload) = env.new_string(payload)
+        {
+            let _ = env.call_static_method(
+                &self.class_ref,
+                "onTransferEvent",
+                "(Ljava/lang/String;)V",
+                &[JValue::from(&j_payload)],
+            );
         }
     }
 }
@@ -258,6 +257,28 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_retryTransfer(
         .map(Into::into)
         .unwrap_or_default();
     if transfer::retry_transfer(&transfer_id) {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_yukon_localsend_RustSDK_configureDeviceIdentity(
+    mut env: JNIEnv,
+    _class: JClass,
+    device_id: JString,
+    device_name: JString,
+) -> jboolean {
+    let device_id: String = env
+        .get_string(&device_id)
+        .map(Into::into)
+        .unwrap_or_default();
+    let device_name: String = env
+        .get_string(&device_name)
+        .map(Into::into)
+        .unwrap_or_default();
+    if transfer::configure_device_identity(device_id, device_name) {
         JNI_TRUE
     } else {
         JNI_FALSE

@@ -1,9 +1,11 @@
-use super::events::{TransferCallback, TransferDirection, TransferEvent, TransferState};
+use super::events::{
+    OfferDisposition, OfferId, TransferCallback, TransferDirection, TransferEvent, TransferState,
+};
 use super::identity::hash_file;
 use super::metadata::{self, TransferMeta};
 use super::protocol::{
-    self, Ack3, AckStatus, ConnectionRole, Done3, Error3, Final3, FrameKind, Hello3, Offer3,
-    Pause3, Plan3, ProtocolError, Range3,
+    self, Ack3, AckStatus, ConnectionRole, Done3, Error3, Final3, FrameKind, Hello3, Invalidate3,
+    Offer3, Pause3, Plan3, ProtocolError, Range3,
 };
 use super::range::{Interval, IntervalSet};
 use blake3::Hasher;
@@ -14,16 +16,57 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 
 pub const RECEIVER_MAX_CONCURRENCY: usize = 12;
+const OFFER_DECISION_TIMEOUT: Duration = Duration::from_secs(300);
+
+pub enum OfferDecision {
+    Accept { destination: PathBuf },
+    Reject,
+}
+
+#[derive(Default)]
+pub struct OfferRegistry {
+    pending: std::sync::Mutex<HashMap<OfferId, oneshot::Sender<OfferDecision>>>,
+}
+
+impl OfferRegistry {
+    pub fn register(&self, offer_id: OfferId) -> oneshot::Receiver<OfferDecision> {
+        let (sender, receiver) = oneshot::channel();
+        self.pending.lock().unwrap().insert(offer_id, sender);
+        receiver
+    }
+
+    pub fn accept(&self, offer_id: &str, destination: PathBuf) -> bool {
+        self.pending
+            .lock()
+            .unwrap()
+            .remove(offer_id)
+            .is_some_and(|sender| sender.send(OfferDecision::Accept { destination }).is_ok())
+    }
+
+    pub fn reject(&self, offer_id: &str) -> bool {
+        self.pending
+            .lock()
+            .unwrap()
+            .remove(offer_id)
+            .is_some_and(|sender| sender.send(OfferDecision::Reject).is_ok())
+    }
+
+    fn remove(&self, offer_id: &str) {
+        self.pending.lock().unwrap().remove(offer_id);
+    }
+}
 
 pub struct ReceiverContext {
     save_dir: PathBuf,
     callback: Arc<dyn TransferCallback>,
     sessions: Mutex<HashMap<String, Arc<ReceiverSession>>>,
+    active_keys: Mutex<HashMap<String, String>>,
+    offers: Arc<OfferRegistry>,
 }
 
 struct ReceiverSession {
@@ -38,11 +81,17 @@ struct ReceiverSession {
 }
 
 impl ReceiverContext {
-    pub fn new(save_dir: impl Into<PathBuf>, callback: Arc<dyn TransferCallback>) -> Self {
+    pub fn new(
+        save_dir: impl Into<PathBuf>,
+        callback: Arc<dyn TransferCallback>,
+        offers: Arc<OfferRegistry>,
+    ) -> Self {
         Self {
             save_dir: save_dir.into(),
             callback,
             sessions: Mutex::new(HashMap::new()),
+            active_keys: Mutex::new(HashMap::new()),
+            offers,
         }
     }
 
@@ -78,6 +127,7 @@ impl ReceiverContext {
                 "pause".into(),
                 "blake3".into(),
                 "resume".into(),
+                "invalidate".into(),
             ],
             receiver_max_concurrency: RECEIVER_MAX_CONCURRENCY as u16,
             session_token: hello.session_token.clone(),
@@ -108,10 +158,32 @@ impl ReceiverContext {
             .peer_addr()
             .map(|value| value.ip().to_string())
             .unwrap_or_default();
-        if !self
-            .callback
-            .on_receive_request(offer.filename.clone(), offer.total_bytes, peer)
-        {
+        let decision_receiver = self.offers.register(offer.transfer_id.clone());
+        let destination = match self.callback.on_offer(
+            offer.transfer_id.clone(),
+            offer.filename.clone(),
+            offer.total_bytes,
+            peer,
+        ) {
+            OfferDisposition::Accept => {
+                self.offers.remove(&offer.transfer_id);
+                Some(self.save_dir.clone())
+            }
+            OfferDisposition::Reject => {
+                self.offers.remove(&offer.transfer_id);
+                None
+            }
+            OfferDisposition::Pending => {
+                match tokio::time::timeout(OFFER_DECISION_TIMEOUT, decision_receiver).await {
+                    Ok(Ok(OfferDecision::Accept { destination })) => Some(destination),
+                    Ok(Ok(OfferDecision::Reject)) | Ok(Err(_)) | Err(_) => {
+                        self.offers.remove(&offer.transfer_id);
+                        None
+                    }
+                }
+            }
+        };
+        let Some(destination) = destination else {
             let plan = Plan3 {
                 accepted: false,
                 session_token: String::new(),
@@ -122,9 +194,33 @@ impl ReceiverContext {
             };
             protocol::write_control(stream, FrameKind::Plan, &plan).await?;
             return Ok(());
+        };
+
+        let token = session_token(&offer.transfer_id, &offer.transfer_key);
+        if !self.reserve_transfer_key(&offer.transfer_key, &token).await {
+            let plan = Plan3 {
+                accepted: false,
+                session_token: String::new(),
+                completed_intervals: Vec::new(),
+                receiver_max_concurrency: RECEIVER_MAX_CONCURRENCY as u16,
+                max_frame_bytes: protocol::MAX_DATA_FRAME as u32,
+                reason: Some("transfer is already active".into()),
+            };
+            protocol::write_control(stream, FrameKind::Plan, &plan).await?;
+            return Ok(());
         }
 
-        let session = self.prepare_session(offer).await?;
+        let transfer_key = offer.transfer_key.clone();
+        let session = match self
+            .prepare_session(offer, destination, token.clone())
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                self.release_transfer_key(&transfer_key, &token).await;
+                return Err(error);
+            }
+        };
         let completed = session
             .meta
             .lock()
@@ -144,31 +240,41 @@ impl ReceiverContext {
             .lock()
             .await
             .insert(session.token.clone(), session.clone());
-        protocol::write_control(stream, FrameKind::Plan, &plan).await?;
-        session.emit(TransferState::Transferring, None, None).await;
+        let result = async {
+            protocol::write_control(stream, FrameKind::Plan, &plan).await?;
+            session.emit(TransferState::Transferring, None, None).await;
 
-        let final_frame: Final3 = protocol::read_control(stream, FrameKind::Final).await?;
-        if final_frame.transfer_id != session.offer.transfer_id
-            || final_frame.content_hash != session.offer.content_hash
-        {
-            return Err(ReceiverError::IdentityMismatch);
+            let final_frame: Final3 = protocol::read_control(stream, FrameKind::Final).await?;
+            if final_frame.transfer_id != session.offer.transfer_id
+                || final_frame.content_hash != session.offer.content_hash
+            {
+                return Err(ReceiverError::IdentityMismatch);
+            }
+            session.emit(TransferState::Verifying, None, None).await;
+            let done = session.finalize().await?;
+            protocol::write_control(stream, FrameKind::Done, &done).await?;
+            session
+                .emit(
+                    TransferState::Completed,
+                    None,
+                    Some(done.final_filename.clone()),
+                )
+                .await;
+            Ok(())
         }
-        session.emit(TransferState::Verifying, None, None).await;
-        let done = session.finalize().await?;
-        protocol::write_control(stream, FrameKind::Done, &done).await?;
+        .await;
         self.sessions.lock().await.remove(&session.token);
-        session
-            .emit(
-                TransferState::Completed,
-                None,
-                Some(done.final_filename.clone()),
-            )
-            .await;
-        Ok(())
+        self.release_transfer_key(&transfer_key, &token).await;
+        result
     }
 
-    async fn prepare_session(&self, offer: Offer3) -> Result<Arc<ReceiverSession>, ReceiverError> {
-        std::fs::create_dir_all(metadata::resume_dir(&self.save_dir))?;
+    async fn prepare_session(
+        &self,
+        offer: Offer3,
+        save_dir: PathBuf,
+        token: String,
+    ) -> Result<Arc<ReceiverSession>, ReceiverError> {
+        std::fs::create_dir_all(metadata::resume_dir(&save_dir))?;
         let expected = TransferMeta::new(
             offer.transfer_key.clone(),
             offer.sender_device_id.clone(),
@@ -176,8 +282,8 @@ impl ReceiverContext {
             offer.total_bytes,
             offer.content_hash.clone(),
         );
-        let part_path = metadata::part_path(&self.save_dir, &offer.transfer_key);
-        let meta = match metadata::load(&self.save_dir, &offer.transfer_key)? {
+        let part_path = metadata::part_path(&save_dir, &offer.transfer_key);
+        let meta = match metadata::load(&save_dir, &offer.transfer_key)? {
             Some(existing)
                 if existing.is_compatible_with(&expected)
                     && part_path
@@ -195,16 +301,15 @@ impl ReceiverContext {
                     .open(&part_path)?;
                 file.set_len(offer.total_bytes)?;
                 file.sync_data()?;
-                metadata::save_atomic(&self.save_dir, &expected)?;
+                metadata::save_atomic(&save_dir, &expected)?;
                 expected
             }
         };
         validate_completed_intervals(&meta)?;
-        let token = session_token(&offer.transfer_id, &offer.transfer_key);
         Ok(Arc::new(ReceiverSession {
             offer,
             token,
-            save_dir: self.save_dir.clone(),
+            save_dir,
             part_path,
             meta: Mutex::new(meta),
             active: Mutex::new(IntervalSet::new()),
@@ -212,18 +317,51 @@ impl ReceiverContext {
             started: Instant::now(),
         }))
     }
+
+    async fn reserve_transfer_key(&self, transfer_key: &str, token: &str) -> bool {
+        for _ in 0..40 {
+            let mut active = self.active_keys.lock().await;
+            if !active.contains_key(transfer_key) {
+                active.insert(transfer_key.to_string(), token.to_string());
+                return true;
+            }
+            drop(active);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    async fn release_transfer_key(&self, transfer_key: &str, token: &str) {
+        let mut active = self.active_keys.lock().await;
+        if active.get(transfer_key).is_some_and(|owner| owner == token) {
+            active.remove(transfer_key);
+        }
+    }
 }
 
 impl ReceiverSession {
     async fn handle_data(&self, stream: &mut TcpStream) -> Result<(), ReceiverError> {
         loop {
-            let range: Range3 = match protocol::read_control(stream, FrameKind::Range).await {
+            let (kind, payload) = match protocol::read_payload(stream).await {
                 Ok(value) => value,
                 Err(ProtocolError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
                     return Ok(());
                 }
                 Err(error) => return Err(error.into()),
             };
+            if kind == FrameKind::Invalidate {
+                let invalidate: Invalidate3 = serde_json::from_slice(&payload)?;
+                self.invalidate_range(stream, &invalidate).await?;
+                continue;
+            }
+            if kind != FrameKind::Range {
+                return Err(ProtocolError::UnexpectedFrame {
+                    expected: FrameKind::Range,
+                    actual: kind,
+                }
+                .into());
+            }
+            let range: Range3 = serde_json::from_slice(&payload)?;
             let interval = range.interval()?;
             if interval.end > self.offer.total_bytes {
                 self.write_rejected(
@@ -237,14 +375,8 @@ impl ReceiverSession {
             }
             let completed = self.meta.lock().await.completed_set();
             if completed.covers(interval) {
-                let ack = Ack3 {
-                    range_id: range.range_id,
-                    committed_end: interval.end,
-                    range_hash: String::new(),
-                    status: AckStatus::Duplicate,
-                    message: None,
-                };
-                protocol::write_control(stream, FrameKind::Ack, &ack).await?;
+                self.receive_duplicate_range(stream, &range, interval)
+                    .await?;
                 continue;
             }
             if completed.overlaps(interval) || self.active.lock().await.overlaps(interval) {
@@ -262,6 +394,95 @@ impl ReceiverSession {
             self.active.lock().await.remove(interval);
             result?;
         }
+    }
+
+    async fn receive_duplicate_range(
+        &self,
+        stream: &mut TcpStream,
+        range: &Range3,
+        interval: Interval,
+    ) -> Result<(), ReceiverError> {
+        let mut committed_end = interval.start;
+        loop {
+            let (kind, payload) = protocol::read_payload(stream).await?;
+            match kind {
+                FrameKind::Data => {
+                    if payload.len() < 8 {
+                        return Err(ProtocolError::InvalidDataFrame.into());
+                    }
+                    let offset = u64::from_be_bytes(payload[..8].try_into().unwrap());
+                    if offset != committed_end {
+                        return Err(ProtocolError::InvalidOffset {
+                            offset,
+                            expected: committed_end,
+                        }
+                        .into());
+                    }
+                    committed_end = committed_end.saturating_add((payload.len() - 8) as u64);
+                    if committed_end > interval.end {
+                        return Err(ReceiverError::RangeOverflow);
+                    }
+                    if committed_end == interval.end {
+                        break;
+                    }
+                }
+                FrameKind::Pause => {
+                    let pause: Pause3 = serde_json::from_slice(&payload)?;
+                    if pause.range_id != range.range_id || pause.generation != range.generation {
+                        return Err(ReceiverError::PauseMismatch);
+                    }
+                    break;
+                }
+                actual => {
+                    return Err(ProtocolError::UnexpectedFrame {
+                        expected: FrameKind::Data,
+                        actual,
+                    }
+                    .into());
+                }
+            }
+        }
+        let hash = hash_part_range(&self.part_path, interval.start, committed_end).await?;
+        let ack = Ack3 {
+            range_id: range.range_id,
+            committed_end,
+            range_hash: hash,
+            status: AckStatus::Duplicate,
+            message: None,
+        };
+        protocol::write_control(stream, FrameKind::Ack, &ack).await?;
+        Ok(())
+    }
+
+    async fn invalidate_range(
+        &self,
+        stream: &mut TcpStream,
+        invalidate: &Invalidate3,
+    ) -> Result<(), ReceiverError> {
+        let interval = invalidate.interval()?;
+        if interval.end > self.offer.total_bytes || self.active.lock().await.overlaps(interval) {
+            self.write_rejected(
+                stream,
+                invalidate.range_id,
+                interval.start,
+                "cannot invalidate active or out-of-bounds range",
+            )
+            .await?;
+            return Ok(());
+        }
+        let mut meta = self.meta.lock().await;
+        meta.invalidate(interval)?;
+        metadata::save_atomic(&self.save_dir, &meta)?;
+        drop(meta);
+        let ack = Ack3 {
+            range_id: invalidate.range_id,
+            committed_end: interval.start,
+            range_hash: String::new(),
+            status: AckStatus::Committed,
+            message: Some("range invalidated".into()),
+        };
+        protocol::write_control(stream, FrameKind::Ack, &ack).await?;
+        Ok(())
     }
 
     async fn receive_range(
@@ -448,6 +669,24 @@ impl ReceiverSession {
     }
 }
 
+async fn hash_part_range(path: &Path, start: u64, end: u64) -> Result<String, ReceiverError> {
+    let mut file = OpenOptions::new().read(true).open(path).await?;
+    file.seek(SeekFrom::Start(start)).await?;
+    let mut remaining = end.saturating_sub(start);
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut hasher = Hasher::new();
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..count]).await?;
+        if read == 0 {
+            return Err(ReceiverError::RangeOverflow);
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 fn validate_completed_intervals(meta: &TransferMeta) -> Result<(), ReceiverError> {
     let mut set = IntervalSet::new();
     for completed in &meta.completed_intervals {
@@ -542,5 +781,70 @@ impl From<io::Error> for ReceiverError {
 impl From<serde_json::Error> for ReceiverError {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pending_offer_can_be_accepted_with_a_destination() {
+        let registry = OfferRegistry::default();
+        let receiver = registry.register("offer-1".into());
+        let destination = PathBuf::from("chosen-directory");
+        assert!(registry.accept("offer-1", destination.clone()));
+        match receiver.await.unwrap() {
+            OfferDecision::Accept {
+                destination: actual,
+            } => assert_eq!(actual, destination),
+            OfferDecision::Reject => panic!("offer was unexpectedly rejected"),
+        }
+        assert!(!registry.accept("offer-1", PathBuf::from("second-choice")));
+    }
+
+    #[tokio::test]
+    async fn pending_offer_can_be_rejected_only_once() {
+        let registry = OfferRegistry::default();
+        let receiver = registry.register("offer-2".into());
+        assert!(registry.reject("offer-2"));
+        assert!(matches!(receiver.await.unwrap(), OfferDecision::Reject));
+        assert!(!registry.reject("offer-2"));
+    }
+
+    #[tokio::test]
+    async fn one_transfer_key_has_only_one_session_owner() {
+        struct Callback;
+        impl TransferCallback for Callback {
+            fn on_receive_request(
+                &self,
+                _file_name: String,
+                _file_size: u64,
+                _sender_ip: String,
+            ) -> bool {
+                true
+            }
+            fn on_progress(&self, _transferred: u64, _total: u64) {}
+            fn on_complete(&self, _success: bool, _msg: String) {}
+        }
+
+        let context = Arc::new(ReceiverContext::new(
+            PathBuf::from("unused"),
+            Arc::new(Callback),
+            Arc::new(OfferRegistry::default()),
+        ));
+        assert!(context.reserve_transfer_key("same-key", "first").await);
+        let waiting = {
+            let context = context.clone();
+            tokio::spawn(async move { context.reserve_transfer_key("same-key", "second").await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished());
+        context
+            .release_transfer_key("same-key", "wrong-owner")
+            .await;
+        assert!(!waiting.is_finished());
+        context.release_transfer_key("same-key", "first").await;
+        assert!(waiting.await.unwrap());
     }
 }

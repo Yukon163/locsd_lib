@@ -1,3 +1,5 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)] // C ABI validates pointers before dereferencing them.
+
 use crate::core::{self, DeviceInfo, DiscoveryCallback, TransferCallback};
 use crate::transfer::{self, TransferEvent};
 use log::{debug, info};
@@ -209,6 +211,23 @@ pub extern "C" fn rust_v3_retry_transfer(transfer_id: *const c_char) -> bool {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn rust_v3_configure_device_identity(
+    device_id: *const c_char,
+    device_name: *const c_char,
+) -> bool {
+    if device_id.is_null() {
+        return false;
+    }
+    let id = unsafe { CStr::from_ptr(device_id).to_string_lossy().into_owned() };
+    let name = if device_name.is_null() {
+        "Windows".into()
+    } else {
+        unsafe { CStr::from_ptr(device_name).to_string_lossy().into_owned() }
+    };
+    transfer::configure_device_identity(id, name)
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_v3_stop_server() {
     transfer::stop_server();
 }
@@ -256,10 +275,10 @@ impl TransferCallback for WindowsV3TransferBridge {
     }
 
     fn on_event(&self, event: TransferEvent) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            if let Ok(payload) = CString::new(json) {
-                (self.on_event)(payload.as_ptr());
-            }
+        if let Ok(json) = serde_json::to_string(&event)
+            && let Ok(payload) = CString::new(json)
+        {
+            (self.on_event)(payload.as_ptr());
         }
     }
 }

@@ -22,6 +22,7 @@ pub enum FrameKind {
     Final = 8,
     Done = 9,
     ErrorResponse = 10,
+    Invalidate = 11,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -39,6 +40,7 @@ impl TryFrom<u8> for FrameKind {
             8 => Ok(Self::Final),
             9 => Ok(Self::Done),
             10 => Ok(Self::ErrorResponse),
+            11 => Ok(Self::Invalidate),
             _ => Err(ProtocolError::UnknownFrameKind(value)),
         }
     }
@@ -113,6 +115,31 @@ impl Range3 {
 pub struct Pause3 {
     pub range_id: u64,
     pub generation: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Invalidate3 {
+    pub range_id: u64,
+    pub start: u64,
+    pub end: u64,
+    pub generation: u32,
+    pub reason: String,
+}
+
+impl Invalidate3 {
+    pub fn interval(&self) -> Result<Interval, ProtocolError> {
+        if self.start >= self.end {
+            return Err(ProtocolError::InvalidRange {
+                start: self.start,
+                end: self.end,
+            });
+        }
+        Ok(Interval {
+            start: self.start,
+            end: self.end,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
