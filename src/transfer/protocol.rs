@@ -3,11 +3,31 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 4;
 pub const FRAME_MAGIC: [u8; 4] = *b"LSD3";
 pub const HEADER_LEN: usize = 10;
 pub const MAX_CONTROL_FRAME: usize = 1024 * 1024;
 pub const MAX_DATA_FRAME: usize = 256 * 1024 + 8;
+
+pub const CAP_RANGE: &str = "range";
+pub const CAP_ACK: &str = "ack";
+pub const CAP_PAUSE: &str = "pause";
+pub const CAP_BLAKE3: &str = "blake3";
+pub const CAP_RESUME: &str = "resume";
+pub const CAP_INVALIDATE: &str = "invalidate";
+pub const CAP_RANGE_STATUS: &str = "range-status";
+pub const CAP_DEFERRED_HASH: &str = "deferred-hash";
+
+pub const REQUIRED_TRANSFER_CAPABILITIES: [&str; 7] = [
+    CAP_RANGE,
+    CAP_ACK,
+    CAP_PAUSE,
+    CAP_BLAKE3,
+    CAP_RESUME,
+    CAP_INVALIDATE,
+    CAP_DEFERRED_HASH,
+];
+pub const REQUIRED_DATA_CAPABILITIES: [&str; 4] = [CAP_RANGE, CAP_ACK, CAP_PAUSE, CAP_INVALIDATE];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -23,6 +43,8 @@ pub enum FrameKind {
     Done = 9,
     ErrorResponse = 10,
     Invalidate = 11,
+    RangeStatus = 12,
+    RangeStatusResult = 13,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -41,6 +63,8 @@ impl TryFrom<u8> for FrameKind {
             9 => Ok(Self::Done),
             10 => Ok(Self::ErrorResponse),
             11 => Ok(Self::Invalidate),
+            12 => Ok(Self::RangeStatus),
+            13 => Ok(Self::RangeStatusResult),
             _ => Err(ProtocolError::UnknownFrameKind(value)),
         }
     }
@@ -81,9 +105,19 @@ pub struct Plan3 {
     pub accepted: bool,
     pub session_token: String,
     pub completed_intervals: Vec<Interval>,
+    #[serde(default)]
+    pub completed_segments: Vec<CompletedSegment3>,
     pub receiver_max_concurrency: u16,
     pub max_frame_bytes: u32,
     pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletedSegment3 {
+    pub start: u64,
+    pub end: u64,
+    pub range_hash: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -93,6 +127,40 @@ pub struct Range3 {
     pub start: u64,
     pub end: u64,
     pub generation: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RangeStatus3 {
+    pub range_id: u64,
+    pub start: u64,
+    pub end: u64,
+    pub generation: u32,
+}
+
+impl RangeStatus3 {
+    pub fn interval(&self) -> Result<Interval, ProtocolError> {
+        if self.start >= self.end {
+            return Err(ProtocolError::InvalidRange {
+                start: self.start,
+                end: self.end,
+            });
+        }
+        Ok(Interval {
+            start: self.start,
+            end: self.end,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RangeStatusResult3 {
+    pub range_id: u64,
+    pub committed_end: u64,
+    pub range_hash: String,
+    #[serde(default)]
+    pub busy: bool,
 }
 
 impl Range3 {

@@ -2,6 +2,7 @@ use super::events::{
     EventSubscriber, OfferDisposition, OfferId, TransferCallback, TransferDirection, TransferEvent,
     TransferId, TransferState,
 };
+use super::identity::{CachedFileIdentity, FileIdentity, SendSource};
 use super::protocol::FRAME_MAGIC;
 use super::receiver::{OfferRegistry, ReceiverContext};
 use super::sender::{self, SendRequest, SenderError, V3SendOutcome};
@@ -26,6 +27,7 @@ struct TransferEngine {
     subscribers: Arc<RwLock<Vec<EventSubscriber>>>,
     offers: Arc<OfferRegistry>,
     device_identity: RwLock<DeviceIdentity>,
+    identity_cache: Arc<Mutex<HashMap<String, CachedFileIdentity>>>,
 }
 
 #[derive(Clone)]
@@ -47,7 +49,11 @@ struct StoredSendRequest {
     transfer_id: TransferId,
     target_ip: String,
     port: u16,
-    file_path: PathBuf,
+    source: SendSource,
+    file_name: String,
+    total_bytes: u64,
+    identity_cache: Arc<Mutex<Option<FileIdentity>>>,
+    source_key: Option<String>,
     callback: Arc<dyn TransferCallback>,
 }
 
@@ -64,6 +70,7 @@ fn engine() -> &'static TransferEngine {
         subscribers: Arc::new(RwLock::new(Vec::new())),
         offers: Arc::new(OfferRegistry::default()),
         device_identity: RwLock::new(default_device_identity()),
+        identity_cache: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 
@@ -149,8 +156,6 @@ pub fn send_file(
     file_path: String,
     callback: Box<dyn TransferCallback>,
 ) -> TransferId {
-    let transfer_id = new_transfer_id();
-    let inner: Arc<dyn TransferCallback> = Arc::from(callback);
     let total = Path::new(&file_path)
         .metadata()
         .map(|value| value.len())
@@ -159,11 +164,58 @@ pub fn send_file(
         .file_name()
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let source_key = std::fs::canonicalize(&file_path)
+        .unwrap_or_else(|_| PathBuf::from(&file_path))
+        .to_string_lossy()
+        .into_owned();
+    send_source(
+        target_ip,
+        port,
+        SendSource::from_path(PathBuf::from(file_path)),
+        file_name,
+        total,
+        Some(source_key),
+        callback,
+    )
+}
+
+#[cfg(unix)]
+pub fn send_file_descriptor(
+    target_ip: String,
+    port: u16,
+    file: std::fs::File,
+    file_name: String,
+    total_bytes: u64,
+    source_key: String,
+    callback: Box<dyn TransferCallback>,
+) -> TransferId {
+    send_source(
+        target_ip,
+        port,
+        SendSource::FileDescriptor(Arc::new(file)),
+        file_name,
+        total_bytes,
+        Some(source_key),
+        callback,
+    )
+}
+
+fn send_source(
+    target_ip: String,
+    port: u16,
+    source: SendSource,
+    file_name: String,
+    total: u64,
+    source_key: Option<String>,
+    callback: Box<dyn TransferCallback>,
+) -> TransferId {
+    let transfer_id = new_transfer_id();
+    let inner: Arc<dyn TransferCallback> = Arc::from(callback);
     let callback: Arc<dyn TransferCallback> = Arc::new(TaskCallback {
         inner,
         subscribers: engine().subscribers.clone(),
         transfer_id: transfer_id.clone(),
-        file_name,
+        file_name: file_name.clone(),
         total,
         started: Instant::now(),
     });
@@ -171,7 +223,11 @@ pub fn send_file(
         transfer_id: transfer_id.clone(),
         target_ip,
         port,
-        file_path: PathBuf::from(file_path),
+        source,
+        file_name,
+        total_bytes: total,
+        identity_cache: Arc::new(Mutex::new(None)),
+        source_key,
         callback,
     };
     spawn_send(stored);
@@ -196,50 +252,60 @@ fn spawn_send(stored: StoredSendRequest) {
             transfer_id: stored.transfer_id.clone(),
             target_ip: stored.target_ip.clone(),
             port: stored.port,
-            file_path: stored.file_path.clone(),
+            source: stored.source.clone(),
+            file_name: stored.file_name.clone(),
+            total_bytes: stored.total_bytes,
+            identity_cache: stored.identity_cache.clone(),
+            source_key: stored.source_key.clone(),
+            shared_identity_cache: engine().identity_cache.clone(),
             sender_device_id: identity.id,
             sender_name: identity.name,
             callback: stored.callback.clone(),
         };
-        match sender::send_v3(request, cancellation.clone()).await {
-            Ok(V3SendOutcome::Completed(_)) => {}
+        let release_source = match sender::send_v3(request, cancellation.clone()).await {
+            Ok(V3SendOutcome::Completed(_)) => true,
             Ok(V3SendOutcome::CompatibilityRequired) => {
                 info!("peer did not complete the V3 pre-offer handshake; entering V2 compatibility layer");
                 if let Err(message) = run_compatibility_fallback(&stored).await {
                     stored.callback.on_complete(false, message);
                 }
+                false
             }
             Err(SenderError::Cancelled) => {
                 let mut event = task_event(&stored, TransferState::Cancelled);
                 event.error_code = Some("cancelled".into());
                 event.message = Some("传输已取消".into());
                 stored.callback.on_event(event);
+                true
             }
             Err(send_error) => {
                 let mut event = task_event(&stored, TransferState::Failed);
                 event.error_code = Some(send_error.code().into());
                 event.message = Some(send_error.to_string());
                 stored.callback.on_event(event);
+                false
             }
-        }
+        };
         finished_tx.send_replace(true);
+        if release_source {
+            engine().tasks.lock().unwrap().remove(&stored.transfer_id);
+        }
     });
 }
 
 async fn run_compatibility_fallback(stored: &StoredSendRequest) -> Result<(), String> {
     let stored = stored.clone();
     tokio::task::spawn_blocking(move || {
-        let metadata = stored
-            .file_path
+        let path = stored
+            .source
+            .path()
+            .ok_or_else(|| "旧版接收端不支持 Android 文件描述符直传，请更新接收端".to_string())?;
+        let metadata = path
             .metadata()
             .map_err(|error| format!("读取文件信息失败: {error}"))?;
         let file_len = metadata.len();
-        let file_name = stored
-            .file_path
-            .file_name()
-            .map(|value| value.to_string_lossy().into_owned())
-            .ok_or_else(|| "无效文件名".to_string())?;
-        let path = stored.file_path.to_string_lossy().into_owned();
+        let file_name = stored.file_name.clone();
+        let path = path.to_string_lossy().into_owned();
         super::legacy::send_file(
             &stored.target_ip,
             stored.port,
@@ -347,22 +413,12 @@ fn new_transfer_id() -> TransferId {
 }
 
 fn task_event(stored: &StoredSendRequest, state: TransferState) -> TransferEvent {
-    let total = stored
-        .file_path
-        .metadata()
-        .map(|value| value.len())
-        .unwrap_or(0);
-    let file_name = stored
-        .file_path
-        .file_name()
-        .map(|value| value.to_string_lossy().into_owned())
-        .unwrap_or_default();
     TransferEvent::new(
         stored.transfer_id.clone(),
         TransferDirection::Send,
         state,
-        file_name,
-        total,
+        stored.file_name.clone(),
+        stored.total_bytes,
         Duration::ZERO,
     )
 }
@@ -566,7 +622,11 @@ mod tests {
             transfer_id: transfer_id.clone(),
             target_ip: "127.0.0.1".into(),
             port: 1,
-            file_path: source,
+            source: SendSource::from_path(source.clone()),
+            file_name: "retry.bin".into(),
+            total_bytes: source.metadata().unwrap().len(),
+            identity_cache: Arc::new(Mutex::new(None)),
+            source_key: Some("retry-test".into()),
             callback: Arc::new(TestCallback {
                 completed: Mutex::new(completed),
             }),

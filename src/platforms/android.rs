@@ -3,8 +3,12 @@ use crate::transfer::{self, TransferEvent};
 use android_logger::Config;
 use jni::objects::{GlobalRef, JClass, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jstring};
+#[cfg(unix)]
+use jni::sys::{jint, jlong};
 use jni::{JNIEnv, JavaVM};
 use log::{LevelFilter, debug, error, info};
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 use std::sync::Arc;
 
 struct AndroidDiscoveryBridge {
@@ -41,6 +45,7 @@ impl DiscoveryCallback for AndroidDiscoveryBridge {
 struct AndroidTransferBridge {
     jvm: Arc<JavaVM>,
     class_ref: GlobalRef,
+    is_sending: bool,
 }
 
 impl TransferCallback for AndroidTransferBridge {
@@ -104,8 +109,12 @@ impl TransferCallback for AndroidTransferBridge {
             let _ = env.call_static_method(
                 &self.class_ref,
                 "onTransferComplete",
-                "(ZLjava/lang/String;)V", // (boolean, String) -> void
-                &[JValue::from(success), JValue::from(&j_msg)],
+                "(ZLjava/lang/String;Z)V", // (boolean, String, isSending) -> void
+                &[
+                    JValue::from(success),
+                    JValue::from(&j_msg),
+                    JValue::from(self.is_sending),
+                ],
             );
         }
     }
@@ -189,6 +198,7 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_startFileServer(
     let bridge = AndroidTransferBridge {
         jvm: Arc::new(jvm),
         class_ref: class_global_ref,
+        is_sending: false,
     };
 
     let save_path: String = env
@@ -217,6 +227,7 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_sendFile(
     let bridge = AndroidTransferBridge {
         jvm: Arc::new(jvm),
         class_ref: class_global_ref,
+        is_sending: true,
     };
 
     let ip: String = env.get_string(&target_ip).unwrap().into();
@@ -224,6 +235,72 @@ pub extern "C" fn Java_com_yukon_localsend_RustSDK_sendFile(
 
     // 假设 4 并行线程
     let transfer_id = core::send_file(ip, 4061, path, 8, Box::new(bridge));
+    env.new_string(transfer_id)
+        .map(|value| value.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_yukon_localsend_RustSDK_sendFileDescriptor(
+    mut env: JNIEnv,
+    _class: JClass,
+    target_ip: JString,
+    raw_fd: jint,
+    file_name: JString,
+    file_size: jlong,
+    source_key: JString,
+) -> jstring {
+    if raw_fd < 0 || file_size < 0 {
+        return env
+            .new_string("")
+            .map(|value| value.into_raw())
+            .unwrap_or(std::ptr::null_mut());
+    }
+
+    let jvm = env.get_java_vm().expect("无法获取 JavaVM");
+    let rust_sdk_class = env
+        .find_class("com/yukon/localsend/RustSDK")
+        .expect("无法找到 RustSDK 类");
+    let class_global_ref = env
+        .new_global_ref(rust_sdk_class)
+        .expect("无法创建全局引用");
+    let bridge = AndroidTransferBridge {
+        jvm: Arc::new(jvm),
+        class_ref: class_global_ref,
+        is_sending: true,
+    };
+    let ip: String = env
+        .get_string(&target_ip)
+        .map(Into::into)
+        .unwrap_or_default();
+    let name: String = env
+        .get_string(&file_name)
+        .map(Into::into)
+        .unwrap_or_default();
+    let source_key: String = env
+        .get_string(&source_key)
+        .map(Into::into)
+        .unwrap_or_default();
+
+    // detachFd() transfers ownership from Android to this File. Its Arc stays alive
+    // for retries and every concurrent pread worker, then closes exactly once.
+    let file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    let metadata_size = file.metadata().map(|value| value.len()).unwrap_or(0);
+    let actual_size = if metadata_size == 0 && file_size > 0 {
+        file_size as u64
+    } else {
+        metadata_size
+    };
+    let transfer_id = transfer::send_file_descriptor(
+        ip,
+        4061,
+        file,
+        name,
+        actual_size,
+        source_key,
+        Box::new(bridge),
+    );
     env.new_string(transfer_id)
         .map(|value| value.into_raw())
         .unwrap_or(std::ptr::null_mut())
