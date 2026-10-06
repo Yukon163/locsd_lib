@@ -10,7 +10,7 @@ lib = []
 
 [lib]
 name = "localsend_core"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 required-features = ["lib"]
 
 [[bin]]
@@ -22,8 +22,6 @@ required-features = ["bin"]
 log = "0.4"
 bytes = "1.0"
 tokio = { version = "1.0", features = ["full"] }
-jni = "0.21"
-android_logger = "0.13"
 local-ip-address = "0.6"
 socket2 = "0.5"
 byteorder = "1.5"
@@ -41,3 +39,7 @@ tokio-util = "0.7"
 atomicwrites = "0.4"
 tower = "0.4"
 tower-http = {version = "0.5", features = ["cors"]}
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+android_logger = "0.13"
